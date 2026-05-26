@@ -110,10 +110,7 @@ func main() {
 	routes.SetupRoutes(app, database.DB, []byte("Hello Word12345678967"), authLimiter)
 
 	// ================= SERVER =================
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8000"
-	}
+	port := "8000"
 
 	middlewares.Log.Info("server starting",
 		zap.String("service", "cryptohub"),
