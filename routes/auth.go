@@ -37,10 +37,10 @@ func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte, authLimiter fiber
 	// ============================
 	// AUTH ROUTES
 	// ============================
-	auth.Post("/register", authHandler.Register)
-	auth.Post("/login", authHandler.Login)
-	auth.Get("/verify", authHandler.VerifyEmail)
-	auth.Post("/resend", authHandler.ResendVerification)
+	auth.Post("/register", authLimiter, authHandler.Register)
+	auth.Post("/login", authLimiter, authHandler.Login)
+	auth.Get("/verify", authLimiter, authHandler.VerifyEmail)
+	auth.Post("/resend", authLimiter, authHandler.ResendVerification)
 	auth.Post("/logout", authLimiter, authHandler.Logout)
 	auth.Post("/forgot-password", authLimiter, authHandler.ForgotPassword)
 	auth.Post("/reset-password", authLimiter, authHandler.ResetPassword)

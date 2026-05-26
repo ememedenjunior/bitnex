@@ -82,7 +82,7 @@ func main() {
 
 	// ================= CORS =================
 	app.Use(cors.New(cors.Config{
-		AllowOrigins:     "http://localhost:5173",
+		AllowOrigins:     "https://crypt-hub-puce.vercel.app",
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization, X-CSRF-Token",
 		AllowCredentials: true,
