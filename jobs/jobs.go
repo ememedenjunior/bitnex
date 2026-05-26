@@ -2,6 +2,7 @@ package jobs
 
 import (
 	"cryptohub/auth"
+	"cryptohub/middlewares"
 	"fmt"
 	"log"
 	"time"
@@ -18,7 +19,9 @@ func StartCron(auth *auth.AuthService) {
 		err := auth.CleanupExpiredTokens()
 		if err != nil {
 			log.Println("cleanup error:", err)
+			middlewares.Error("cleanup error:", err)
 		} else {
+			middlewares.Info("expired tokens cleaned at")
 			log.Println("expired tokens cleaned at", time.Now())
 		}
 	})

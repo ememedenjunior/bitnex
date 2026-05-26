@@ -1,8 +1,10 @@
 package auth
 
 import (
+	"context"
 	"crypto/rand"
-	"cryptohub/core/wallet/solana"
+	"cryptohub/core/ledger"
+	"cryptohub/core/wallet/hdwallet"
 	"cryptohub/pkg/utils"
 	"database/sql"
 	"encoding/base64"
@@ -37,7 +39,7 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 	}
 
 	var exists bool
-	err := s.DB.QueryRow(`
+	err := s.DB.QueryRowContext(context.Background(), `
 		SELECT EXISTS(
 			SELECT 1 FROM users WHERE email=$1 OR username=$2
 		)
@@ -58,7 +60,7 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 
 	userID, _ := utils.GenerateSecure10DigitNumber()
 
-	_, err = s.DB.Exec(`
+	_, err = s.DB.ExecContext(context.Background(), `
 		INSERT INTO users (user_uid, email, username, password_hash, is_verified, created_at, updated_at)
 		VALUES ($1,$2,$3,$4,false,NOW(),NOW())
 	`, userID, email, username, string(hash))
@@ -68,16 +70,22 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 	}
 
 	// create default accounts
-	assets := []string{"SOLANA"}
+	assets := []string{"BITCOIN", "ETHEREUM", "BNB", "SOLANA", "XRP", "SUI"}
+	var account ledger.Ledger
+	account.Db = s.DB
 
 	for _, asset := range assets {
-		_, _ = s.DB.Exec(`
-			INSERT INTO accounts (id, user_uid, asset, balance, created_at)
-			VALUES ($1,$2,$3,0,NOW())
-		`, uuid.New(), userID, asset)
+		err := account.CreateAccount(context.Background(), userID, asset)
+		if err != nil {
+			return "", err
+		}
 	}
 
-	e := solana.CreateUserSolanaWallet(userID, []byte("wsfouyrkrsqljtie"))
+	hd, err := hdwallet.NewWalletManager(s.DB, []byte("wsfouyrkrsqljtie"))
+	if err != nil {
+
+	}
+	e := hd.CreateAllUserWallets(context.Background(), userID)
 	if e != nil {
 		return "", e
 	}
@@ -85,7 +93,7 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 	// verification token
 	token, _ := utils.GenerateSecure6DigitCode()
 
-	_, err = s.DB.Exec(`
+	_, err = s.DB.ExecContext(context.Background(), `
 		INSERT INTO verification_tokens (email, token, expires_at, used, created_at)
 		VALUES ($1,$2,$3,false,NOW())
 	`, email, token, time.Now().Add(24*time.Hour))
@@ -106,7 +114,7 @@ func (s *AuthService) VerifyUser(token string) error {
 		used      bool
 	)
 
-	err := s.DB.QueryRow(`
+	err := s.DB.QueryRowContext(context.Background(), `
 		SELECT id, email, expires_at, used
 		FROM verification_tokens
 		WHERE token = $1
@@ -132,21 +140,23 @@ func (s *AuthService) VerifyUser(token string) error {
 		return err
 	}
 
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(context.Background(), `
 		UPDATE users SET is_verified=true, updated_at=NOW()
 		WHERE email=$1
 	`, email)
 
 	if err != nil {
+
 		tx.Rollback()
 		return err
 	}
 
-	_, err = tx.Exec(`
+	_, err = tx.ExecContext(context.Background(), `
 		UPDATE verification_tokens SET used=true WHERE id=$1
 	`, id)
 
 	if err != nil {
+
 		tx.Rollback()
 		return err
 	}
@@ -156,14 +166,15 @@ func (s *AuthService) VerifyUser(token string) error {
 
 func (s *AuthService) ResendVerification(email string) (string, error) {
 
-	token := uuid.New().String()
+	token, _ := utils.GenerateSecure6DigitCode()
 
-	_, err := s.DB.Exec(`
+	_, err := s.DB.ExecContext(context.Background(), `
 		INSERT INTO verification_tokens (id, email, token, expires_at, used, created_at)
 		VALUES ($1,$2,$3,$4,false,NOW())
 	`, uuid.New().String(), email, token, time.Now().Add(24*time.Hour))
 
 	if err != nil {
+
 		return "", err
 	}
 
@@ -171,10 +182,11 @@ func (s *AuthService) ResendVerification(email string) (string, error) {
 }
 
 func (s *AuthService) CleanupExpiredTokens() error {
-	_, err := s.DB.Exec(`
+	_, err := s.DB.ExecContext(context.Background(), `
 		DELETE FROM verification_tokens
 		WHERE expires_at < NOW() OR used = true
 	`)
+
 	return err
 }
 
@@ -182,12 +194,13 @@ func (s *AuthService) Login(email, password string) (userID, username string, ve
 
 	var passwordHash string
 
-	err = s.DB.QueryRow(`
+	err = s.DB.QueryRowContext(context.Background(), `
 		SELECT user_uid, username, password_hash, is_verified
 		FROM users WHERE email=$1
 	`, email).Scan(&userID, &username, &passwordHash, &verified)
 
 	if err != nil {
+
 		if err == sql.ErrNoRows {
 			return "", "", false, errors.New("invalid credentials")
 		}
@@ -199,6 +212,7 @@ func (s *AuthService) Login(email, password string) (userID, username string, ve
 	}
 
 	if !verified {
+
 		return "", "", false, errors.New("email not verified")
 	}
 
@@ -246,4 +260,127 @@ func GenerateCSRFToken() (string, error) {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+func (s *AuthService) ForgotPassword(email string) (string, error) {
+
+	var exists bool
+	ctx := context.Background()
+
+	err := s.DB.QueryRowContext(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM users WHERE email=$1
+		)
+	`, email).Scan(&exists)
+
+	if err != nil {
+
+		return "", err
+	}
+
+	if !exists {
+		return "", err
+	}
+
+	token, err := utils.GenerateSecure6DigitCode()
+	if err != nil {
+		return "", err
+	}
+
+	_, err = s.DB.ExecContext(context.Background(), `
+		INSERT INTO verification_tokens
+		(email, token, expires_at, used, created_at)
+		VALUES ($1,$2,$3,false,NOW())
+	`,
+		email,
+		token,
+		time.Now().Add(30*time.Minute),
+	)
+
+	if err != nil {
+
+		return "", err
+	}
+
+	return token, nil
+}
+
+func (s *AuthService) ResetPassword(token, newPassword string) error {
+
+	if len(newPassword) < 8 {
+		return errors.New("password too weak")
+	}
+
+	var (
+		email     string
+		expiresAt time.Time
+		used      bool
+	)
+
+	err := s.DB.QueryRowContext(context.Background(), `
+		SELECT email, expires_at, used
+		FROM verification_tokens
+		WHERE token=$1
+	`, token).Scan(
+		&email,
+		&expiresAt,
+		&used,
+	)
+
+	if err != nil {
+
+		if err == sql.ErrNoRows {
+			return errors.New("invalid token")
+		}
+		return err
+	}
+
+	if used {
+		return errors.New("token already used")
+	}
+
+	if time.Now().After(expiresAt) {
+		return errors.New("token expired")
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword(
+		[]byte(newPassword),
+		14,
+	)
+
+	if err != nil {
+
+		return err
+	}
+
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.ExecContext(context.Background(), `
+		UPDATE users
+		SET password_hash=$1,
+		    updated_at=NOW()
+		WHERE email=$2
+	`, string(passwordHash), email)
+
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	_, err = tx.ExecContext(context.Background(), `
+		UPDATE verification_tokens
+		SET used=true
+		WHERE email=$1
+	`, email)
+
+	if err != nil {
+
+		tx.Rollback()
+		return err
+	}
+
+	return tx.Commit()
 }

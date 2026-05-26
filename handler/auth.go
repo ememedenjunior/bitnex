@@ -30,19 +30,19 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	token, err := h.Service.Register(body.Email, body.Username, body.Password)
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{
-			"message": "Internal Server Error",
+			"message": err.Error(),
 		})
 	}
 
 	e := middlewares.SendVerificationEmail(body.Email, token)
 	if e != nil {
 		return c.Status(500).JSON(fiber.Map{
-			"message": "Internal Server Email Error",
+			"message": e.Error(),
 		})
 	}
 
 	return c.Status(201).JSON(fiber.Map{
-		"message": "user created successfully, check your email for verification", "token": token,
+		"message": "user created successfully, check your email for verification",
 	})
 }
 
@@ -51,14 +51,14 @@ func (h *AuthHandler) VerifyEmail(c *fiber.Ctx) error {
 	token := c.Query("token")
 	if token == "" {
 		return c.Status(400).JSON(fiber.Map{
-			"error": "missing token",
+			"message": "missing token",
 		})
 	}
 
 	err := h.Service.VerifyUser(token)
 	if err != nil {
-		return c.Status(400).JSON(fiber.Map{
-			"error": err.Error(),
+		return c.Status(500).JSON(fiber.Map{
+			"message": "Internal Server Error",
 		})
 	}
 
@@ -72,14 +72,14 @@ func (h *AuthHandler) ResendVerification(c *fiber.Ctx) error {
 	email := c.Query("email")
 	if email == "" {
 		return c.Status(400).JSON(fiber.Map{
-			"error": "missing email",
+			"message": "missing email",
 		})
 	}
 
 	token, err := h.Service.ResendVerification(email)
 	if err != nil {
-		return c.Status(400).JSON(fiber.Map{
-			"error": err.Error(),
+		return c.Status(500).JSON(fiber.Map{
+			"message": "Internal Server Error",
 		})
 	}
 
@@ -106,14 +106,14 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 
 	if err := c.BodyParser(&body); err != nil {
 		return c.Status(400).JSON(fiber.Map{
-			"error": "invalid request",
+			"message": "invalid request",
 		})
 	}
 
 	userID, username, verified, err := h.Service.Login(body.Email, body.Password)
 	if err != nil {
 		return c.Status(401).JSON(fiber.Map{
-			"error": err.Error(),
+			"message": err.Error(),
 		})
 	}
 
@@ -121,7 +121,7 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	token, err := h.Service.GenerateToken(userID, body.Email, verified)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{
-			"error": "failed to generate token",
+			"message": "failed to generate token",
 		})
 	}
 
@@ -129,7 +129,7 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	csrfToken, err := auth.GenerateCSRFToken()
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{
-			"error": "failed csrf token",
+			"message": "failed csrf token",
 		})
 	}
 
@@ -195,14 +195,14 @@ func (h *AuthHandler) AuthMiddleware(c *fiber.Ctx) error {
 	token := c.Cookies("auth_token")
 	if token == "" {
 		return c.Status(401).JSON(fiber.Map{
-			"error": "unauthorized",
+			"message": "unauthorized",
 		})
 	}
 
 	claims, err := h.Service.ValidateToken(token)
 	if err != nil {
 		return c.Status(401).JSON(fiber.Map{
-			"error": "invalid token",
+			"message": "invalid token",
 		})
 	}
 
@@ -214,7 +214,7 @@ func (h *AuthHandler) AuthMiddleware(c *fiber.Ctx) error {
 
 		if csrfCookie == "" || csrfHeader == "" || csrfCookie != csrfHeader {
 			return c.Status(403).JSON(fiber.Map{
-				"error": "CSRF validation failed",
+				"message": "CSRF validation failed",
 			})
 		}
 	}
@@ -224,4 +224,65 @@ func (h *AuthHandler) AuthMiddleware(c *fiber.Ctx) error {
 	c.Locals("email", claims.Email)
 
 	return c.Next()
+}
+
+func (h *AuthHandler) ForgotPassword(c *fiber.Ctx) error {
+
+	var req struct {
+		Email string `json:"email"`
+	}
+
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{
+			"message": "invalid request",
+		})
+	}
+
+	token, err := h.Service.ForgotPassword(req.Email)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{
+			"message": err.Error(),
+		})
+	}
+
+	e := middlewares.SendVerificationEmail(req.Email, token)
+	if e != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"message": "Internal Server Email Error",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"message": "password reset token sent to email",
+	})
+}
+
+func (h *AuthHandler) ResetPassword(c *fiber.Ctx) error {
+
+	var req struct {
+		Token       string `json:"token"`
+		NewPassword string `json:"newPassword"`
+	}
+
+	if err := c.BodyParser(&req); err != nil {
+
+		return c.Status(400).JSON(fiber.Map{
+			"message": "invalid request",
+		})
+	}
+
+	err := h.Service.ResetPassword(
+		req.Token,
+		req.NewPassword,
+	)
+
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{
+			"message": err.Error(),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"message": "password reset successful",
+	})
 }

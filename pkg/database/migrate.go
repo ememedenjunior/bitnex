@@ -56,16 +56,16 @@ func MigrateWallets() {
 
 	query := `
 	CREATE TABLE IF NOT EXISTS wallets (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-
-		user_uid BIGINT NOT NULL UNIQUE,
-
-		address TEXT NOT NULL UNIQUE,
-		asset TEXT NOT NULL,
-
-		encrypted_private_key TEXT NOT NULL,
-
-		created_at TIMESTAMP DEFAULT NOW()
+		id BIGSERIAL PRIMARY KEY,
+		user_uid BIGINT NOT NULL,
+		chain VARCHAR(50) NOT NULL,
+		address VARCHAR(255) NOT NULL UNIQUE,
+		private_key_encrypted TEXT NOT NULL,
+		derivation_path VARCHAR(255) NOT NULL,
+		derivation_index BIGINT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		is_active BOOLEAN DEFAULT true
 	);
 	`
 
@@ -77,25 +77,30 @@ func MigrateWallets() {
 	log.Println("✅ Wallets migration completed")
 }
 
-func MigrateSessions() {
+func MigrateHotWallets() {
 
 	query := `
-	CREATE TABLE IF NOT EXISTS refresh_tokens (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		user_uid BIGINT NOT NULL,
-		refresh_token TEXT NOT NULL,
-		expires_at TIMESTAMP NOT NULL,
-		revoked BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMP DEFAULT NOW()
+	CREATE TABLE IF NOT EXISTS hot_wallets (
+		id BIGSERIAL PRIMARY KEY,
+		chain VARCHAR(50) NOT NULL,
+		mnemonic_encrypted TEXT NOT NULL,
+		address VARCHAR(255) NOT NULL UNIQUE,
+		private_key_encrypted TEXT NOT NULL,
+		balance DECIMAL(40, 18) DEFAULT 0,
+		derivation_path VARCHAR(255) NOT NULL,
+		wallet_index INTEGER DEFAULT 0,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		is_active BOOLEAN DEFAULT true
 	);
 	`
 
 	_, err := DB.Exec(query)
 	if err != nil {
-		log.Fatal("❌ Sessions migration failed:", err)
+		log.Fatal("❌ Wallets migration failed:", err)
 	}
 
-	log.Println("✅ Sessions migration completed")
+	log.Println("✅ Wallets migration completed")
 }
 
 func MigrateVerificationTokens() {
@@ -103,7 +108,7 @@ func MigrateVerificationTokens() {
 	query := `
 	CREATE TABLE IF NOT EXISTS verification_tokens (
 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		email TEXT UNIQUE NOT NULL,
+		email TEXT NOT NULL,
 		token TEXT UNIQUE NOT NULL,
 		expires_at TIMESTAMP NOT NULL,
 		used BOOLEAN DEFAULT FALSE,
@@ -119,28 +124,49 @@ func MigrateVerificationTokens() {
 	log.Println("✅ Verification tokens migration completed")
 }
 
-func MigrateTokenAccounts() {
+// func MigrateSessions() {
 
-	query := `
-	CREATE TABLE IF NOT EXISTS token_accounts (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+// 	query := `
+// 	CREATE TABLE IF NOT EXISTS refresh_tokens (
+// 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+// 		user_uid BIGINT NOT NULL,
+// 		refresh_token TEXT NOT NULL,
+// 		expires_at TIMESTAMP NOT NULL,
+// 		revoked BOOLEAN DEFAULT FALSE,
+// 		created_at TIMESTAMP DEFAULT NOW()
+// 	);
+// 	`
 
-		user_id UUID NOT NULL,
+// 	_, err := DB.Exec(query)
+// 	if err != nil {
+// 		log.Fatal("❌ Sessions migration failed:", err)
+// 	}
 
-		wallet_address TEXT NOT NULL,
+// 	log.Println("✅ Sessions migration completed")
+// }
 
-		token_mint TEXT NOT NULL,
+// func MigrateTokenAccounts() {
 
-		token_account_address TEXT NOT NULL UNIQUE,
+// 	query := `
+// 	CREATE TABLE IF NOT EXISTS token_accounts (
+// 		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
-		symbol TEXT,
+// 		user_id UUID NOT NULL,
 
-		created_at TIMESTAMP DEFAULT NOW()
-	);
-	`
+// 		wallet_address TEXT NOT NULL,
 
-	_, err := DB.Exec(query)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
+// 		token_mint TEXT NOT NULL,
+
+// 		token_account_address TEXT NOT NULL UNIQUE,
+
+// 		symbol TEXT,
+
+// 		created_at TIMESTAMP DEFAULT NOW()
+// 	);
+// 	`
+
+// 	_, err := DB.Exec(query)
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
+// }

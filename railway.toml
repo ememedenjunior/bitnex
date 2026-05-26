@@ -1,5 +1,0 @@
-[build]
-buildCommand = "go build -ldflags=\"-w -s\" -o out ."
-
-[deploy]
-startCommand = "./out"

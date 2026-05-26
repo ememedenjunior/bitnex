@@ -2,11 +2,7 @@ package middlewares
 
 import (
 	"fmt"
-	"log"
 	"net/smtp"
-	"os"
-
-	"github.com/joho/godotenv"
 )
 
 const (
@@ -23,25 +19,28 @@ var (
 	password  string
 )
 
-func init() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("⚠️ .env file not found, using system env")
-	}
+// func init() {
+// 	err := godotenv.Load()
+// 	if err != nil {
+// 		log.Println("⚠️ .env file not found, using system env")
+// 	}
 
-	fromEmail = os.Getenv("EMAIL_USER")
-	password = os.Getenv("EMAIL_PASS")
+// 	fromEmail = os.Getenv("EMAIL_USER")
+// 	password = os.Getenv("EMAIL_PASS")
 
-	if fromEmail == "" || password == "" {
-		log.Fatal("❌ Missing SMTP credentials")
-	}
-}
+// 	if fromEmail == "" || password == "" {
+// 		log.Fatal("❌ Missing SMTP credentials")
+// 	}
+// }
 
 // ============================
 // SEND VERIFICATION EMAIL (TOKEN ONLY)
 // ============================
 
 func SendVerificationEmail(toEmail, token string) error {
+
+	fromEmail = "simplyemem10@gmail.com"
+	password = "wsfouyrkrsqljtie"
 
 	subject := "Your Verification Code 🚀"
 

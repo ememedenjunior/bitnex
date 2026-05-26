@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"log"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -12,35 +13,29 @@ import (
 var DB *sql.DB
 
 func ConnectDB() {
+	// Load env (only for local dev)
+	_ = godotenv.Load()
 
-	// Load .env file
-	err := godotenv.Load()
-	if err != nil {
-		log.Fatal("❌ Error loading .env file")
+	dbURL := os.Getenv("DB_URL")
+	if dbURL == "" {
+		log.Fatal("❌ DB_URL is not set")
 	}
 
-	// Get DB URL from environment
-	dsn := os.Getenv("DB_URL")
-
-	if dsn == "" {
-		log.Fatal("❌ DB_URL is missing in .env")
-	}
-
-	// Open database connection
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal("❌ Failed to open DB connection:", err)
 	}
 
-	// Verify database connection
-	err = db.Ping()
-	if err != nil {
+	// Verify connection
+	if err := db.Ping(); err != nil {
 		log.Fatal("❌ Failed to connect to database:", err)
 	}
 
-	// Production connection pool settings
+	// Connection pool tuning (good for production)
 	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(10)
+	db.SetMaxIdleConns(25)
+	db.SetConnMaxLifetime(time.Minute * 5)
+	db.SetConnMaxIdleTime(time.Minute * 2)
 
 	DB = db
 

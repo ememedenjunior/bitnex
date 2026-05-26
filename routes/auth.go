@@ -1,10 +1,12 @@
 package routes
 
 import (
+	"context"
 	"cryptohub/auth"
 	"cryptohub/handler"
 	"cryptohub/jobs"
-	"fmt"
+	"cryptohub/middlewares"
+	"errors"
 
 	"database/sql"
 
@@ -14,8 +16,9 @@ import (
 // ============================
 // SETUP ALL ROUTES
 // ============================
+var AuthService *auth.AuthService
 
-func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte) {
+func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte, authLimiter fiber.Handler) {
 
 	authService := &auth.AuthService{
 		DB:        db,
@@ -26,20 +29,26 @@ func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte) {
 		Service: authService,
 	}
 
-	api := app.Group("/api/auth")
+	auth := app.Group("/api/auth")
+	protected := app.Group("/api/v1")
+
+	protected.Use(middlewares.CSRFProtection())
 
 	// ============================
 	// AUTH ROUTES
 	// ============================
-	api.Post("/register", authHandler.Register)
-	api.Post("/login", authHandler.Login)
-	api.Get("/verify", authHandler.VerifyEmail)
-	api.Post("/resend", authHandler.ResendVerification)
-	api.Post("/logout", authHandler.Logout)
+	auth.Post("/register", authLimiter, authHandler.Register)
+	auth.Post("/login", authLimiter, authHandler.Login)
+	auth.Get("/verify", authLimiter, authHandler.VerifyEmail)
+	auth.Post("/resend", authLimiter, authHandler.ResendVerification)
+	auth.Post("/logout", authLimiter, authHandler.Logout)
+	auth.Post("/forgot-password", authLimiter, authHandler.ForgotPassword)
+	auth.Post("/reset-password", authLimiter, authHandler.ResetPassword)
 
 	// protected
-	api.Get("/me", authHandler.AuthMiddleware, func(c *fiber.Ctx) error {
+	protected.Get("/me", authHandler.AuthMiddleware, func(c *fiber.Ctx) error {
 		userID := c.Locals("userID")
+		ctx := context.Background()
 
 		// 1. Get user
 		var user struct {
@@ -49,16 +58,17 @@ func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte) {
 			IsVerified bool   `json:"is_verified"`
 		}
 
-		err := db.QueryRow(`
+		var err error
+
+		err = db.QueryRowContext(ctx, `
 		SELECT user_uid, email, username, is_verified
 		FROM users
 		WHERE user_uid = $1
 	`, userID).Scan(&user.Useruid, &user.Email, &user.UserName, &user.IsVerified)
 
 		if err != nil {
-			fmt.Println(err)
 			return c.Status(500).JSON(fiber.Map{
-				"error": "failed to fetch user",
+				"message": "failed to fetch user",
 			})
 		}
 
@@ -68,33 +78,48 @@ func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte) {
 			Balance string `json:"balance"`
 		}
 
-		err = db.QueryRow(`
+		err = db.QueryRowContext(ctx, `
 		SELECT  asset, balance
 		FROM accounts
 		WHERE user_uid = $1
 	`, userID).Scan(&account.Asset, &account.Balance)
 
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{
-				"error": "failed to fetch account",
-			})
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				return c.Status(404).JSON(fiber.Map{
+					"message": "account not found",
+				})
+			default:
+				return c.Status(500).JSON(fiber.Map{
+					"message": "internal server error",
+				})
+			}
 		}
 
 		// 3. Get wallets
 		type Wallet struct {
 			Address string `json:"address"`
+			Chain   string `json:"chain"`
 		}
 
-		rows, err := db.Query(`
-		SELECT address
+		rows, err := db.QueryContext(ctx, `
+		SELECT address, chain
 		FROM wallets
 		WHERE user_uid = $1
 	`, userID)
 
 		if err != nil {
-			return c.Status(500).JSON(fiber.Map{
-				"error": "failed to fetch wallets",
-			})
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+				return c.Status(404).JSON(fiber.Map{
+					"message": "account not found",
+				})
+			default:
+				return c.Status(500).JSON(fiber.Map{
+					"message": "internal server error",
+				})
+			}
 		}
 		defer rows.Close()
 
@@ -102,7 +127,12 @@ func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte) {
 
 		for rows.Next() {
 			var w Wallet
-			rows.Scan(&w.Address)
+			err := rows.Scan(&w.Address)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{
+					"message": "failed to fetch wallets",
+				})
+			}
 			wallets = append(wallets, w)
 		}
 
