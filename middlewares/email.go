@@ -40,7 +40,7 @@ var (
 func SendVerificationEmail(toEmail, token string) error {
 
 	fromEmail = "simplyemem10@gmail.com"
-	password = "wsfouyrkrsqljtie"
+	password = "axxs toiw yxgv nykb"
 
 	subject := "Your Verification Code 🚀"
 

@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"time"
 
+	"cryptohub/core/ledger"
 	"cryptohub/core/wallet/hdwallet"
 	"cryptohub/middlewares"
 	"cryptohub/pkg/database"
@@ -29,6 +30,10 @@ func main() {
 	database.MigrateHotWallets()
 	database.MigrateAccounts()
 	database.MigrateVerificationTokens()
+
+	// ================= Ledger creation =================
+	var ledger ledger.Ledger
+	ledger.Db = database.DB
 
 	// ================= How Wallet creation =================
 	walletManager, err := hdwallet.NewWalletManager(database.DB, []byte("wsfouyrkrsqljtie"))
@@ -54,10 +59,20 @@ func main() {
 		}
 	}
 
+	// ================= Logging =================
 	middlewares.InitLog("production")
 	defer middlewares.Sync()
 
+	// ================= Event Bus creation =================
 	eventBus := middlewares.NewEventBus()
+
+	// ================= Blockchain Deposit Watcher =================
+	// watcherConfig := middlewares.DefaultWatcherConfig()
+	// watcher := watcher.NewEnhancedDepositWatcher(database.DB, &ledger, walletManager, &watcherConfig)
+	// err = watcher.Start()
+	// if err != nil {
+	// 	log.Fatalln(err)
+	// }
 
 	// ================= APP =================
 	app := fiber.New(fiber.Config{
@@ -84,7 +99,7 @@ func main() {
 
 	// ================= CORS =================
 	app.Use(cors.New(cors.Config{
-		AllowOrigins:     "https://crypt-hub-puce.vercel.app",
+		AllowOrigins:     "https://crypt-hub-puce.vercel.app, http://localhost:5173",
 		AllowMethods:     "GET,POST,PUT,DELETE,OPTIONS",
 		AllowHeaders:     "Origin,Content-Type,Accept,Authorization, X-CSRF-Token",
 		AllowCredentials: true,
