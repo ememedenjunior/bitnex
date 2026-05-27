@@ -57,6 +57,8 @@ func main() {
 	middlewares.InitLog("production")
 	defer middlewares.Sync()
 
+	eventBus := middlewares.NewEventBus()
+
 	// ================= APP =================
 	app := fiber.New(fiber.Config{
 		Prefork:       false,
@@ -107,7 +109,7 @@ func main() {
 	})
 
 	// ================= ROUTES =================
-	routes.SetupRoutes(app, database.DB, []byte("Hello Word12345678967"), authLimiter)
+	routes.SetupRoutes(app, database.DB, []byte("Hello Word12345678967"), authLimiter, eventBus)
 
 	// ================= SERVER =================
 	port := "8000"

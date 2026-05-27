@@ -7,6 +7,7 @@ import (
 	"cryptohub/jobs"
 	"cryptohub/middlewares"
 	"errors"
+	"log"
 
 	"database/sql"
 
@@ -18,7 +19,7 @@ import (
 // ============================
 var AuthService *auth.AuthService
 
-func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte, authLimiter fiber.Handler) {
+func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte, authLimiter fiber.Handler, eventBus *middlewares.EventBus) {
 
 	authService := &auth.AuthService{
 		DB:        db,
@@ -145,4 +146,23 @@ func SetupRoutes(app *fiber.App, db *sql.DB, jwtSecret []byte, authLimiter fiber
 	})
 
 	jobs.StartCron(authService)
+	eventBus.Subscribe(
+		middlewares.UserRegistrationFailed,
+		func(data any) {
+			payload := data.(middlewares.UserRegistrationFailedPayload)
+
+			err := authService.CleanupUnverifiedUserIfError(
+				payload.Email,
+				payload.UserUID,
+			)
+
+			if err != nil {
+				log.Printf(
+					"cleanup failed for user %d: %v",
+					payload.UserUID,
+					err,
+				)
+			}
+		},
+	)
 }

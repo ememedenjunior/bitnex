@@ -27,8 +27,16 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 		})
 	}
 
-	token, err := h.Service.Register(body.Email, body.Username, body.Password)
+	token, user_id, err := h.Service.Register(body.Email, body.Username, body.Password)
 	if err != nil {
+		h.Service.EventBus.Publish(
+			middlewares.UserRegistrationFailed,
+			middlewares.UserRegistrationFailedPayload{
+				Email:   body.Email,
+				UserUID: user_id,
+				Reason:  err,
+			},
+		)
 		return c.Status(400).JSON(fiber.Map{
 			"message": err.Error(),
 		})
@@ -36,6 +44,14 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 
 	e := middlewares.SendVerificationEmail(body.Email, token)
 	if e != nil {
+		h.Service.EventBus.Publish(
+			middlewares.UserRegistrationFailed,
+			middlewares.UserRegistrationFailedPayload{
+				Email:   body.Email,
+				UserUID: user_id,
+				Reason:  err,
+			},
+		)
 		return c.Status(500).JSON(fiber.Map{
 			"message": e.Error(),
 		})

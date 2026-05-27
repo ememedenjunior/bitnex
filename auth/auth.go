@@ -5,10 +5,12 @@ import (
 	"crypto/rand"
 	"cryptohub/core/ledger"
 	"cryptohub/core/wallet/hdwallet"
+	"cryptohub/middlewares"
 	"cryptohub/pkg/utils"
 	"database/sql"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -26,16 +28,17 @@ type Claims struct {
 type AuthService struct {
 	DB        *sql.DB
 	JWTSecret []byte
+	EventBus  *middlewares.EventBus
 }
 
-func (s *AuthService) Register(email, username, password string) (string, error) {
+func (s *AuthService) Register(email, username, password string) (string, int64, error) {
 
 	if email == "" || username == "" || password == "" {
-		return "", errors.New("missing required fields")
+		return "", 0, errors.New("missing required fields")
 	}
 
 	if len(password) < 8 {
-		return "", errors.New("password too weak")
+		return "", 0, errors.New("password too weak")
 	}
 
 	var exists bool
@@ -46,16 +49,16 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 	`, email, username).Scan(&exists)
 
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	if exists {
-		return "", errors.New("user already exists")
+		return "", 0, errors.New("user already exists")
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 14)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 
 	userID, _ := utils.GenerateSecure10DigitNumber()
@@ -66,7 +69,7 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 	`, userID, email, username, string(hash))
 
 	if err != nil {
-		return "", err
+		return "", userID, err
 	}
 
 	// create default accounts
@@ -77,7 +80,7 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 	for _, asset := range assets {
 		err := account.CreateAccount(context.Background(), userID, asset)
 		if err != nil {
-			return "", err
+			return "", userID, err
 		}
 	}
 
@@ -87,7 +90,7 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 	}
 	e := hd.CreateAllUserWallets(context.Background(), userID)
 	if e != nil {
-		return "", e
+		return "", userID, e
 	}
 
 	// verification token
@@ -99,10 +102,10 @@ func (s *AuthService) Register(email, username, password string) (string, error)
 	`, email, token, time.Now().Add(24*time.Hour))
 
 	if err != nil {
-		return "", err
+		return "", userID, err
 	}
 
-	return token, nil
+	return token, userID, nil
 }
 
 func (s *AuthService) VerifyUser(token string) error {
@@ -188,6 +191,78 @@ func (s *AuthService) CleanupExpiredTokens() error {
 	`)
 
 	return err
+}
+
+func (s *AuthService) CleanupUnverifiedUserIfError(email string, userUID int64) error {
+	ctx := context.Background()
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Verify user exists and is unverified
+	var exists bool
+	err = tx.QueryRowContext(
+		ctx,
+		`
+		SELECT EXISTS(
+			SELECT 1
+			FROM users
+			WHERE email = $1
+			AND user_uid = $2
+			AND is_verified = false
+		)
+		`,
+		email,
+		userUID,
+	).Scan(&exists)
+	if err != nil {
+		return err
+	}
+
+	if !exists {
+		return fmt.Errorf("user not found or already verified")
+	}
+
+	// Delete wallets first
+	_, err = tx.ExecContext(
+		ctx,
+		`DELETE FROM wallets WHERE user_uid = $1`,
+		userUID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Delete accounts
+	_, err = tx.ExecContext(
+		ctx,
+		`DELETE FROM accounts WHERE user_uid = $1`,
+		userUID,
+	)
+	if err != nil {
+		return err
+	}
+
+	// Delete user
+	_, err = tx.ExecContext(
+		ctx,
+		`
+		DELETE FROM users
+		WHERE email = $1
+		AND user_uid = $2
+		AND is_verified = false
+		`,
+		email,
+		userUID,
+	)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
 }
 
 func (s *AuthService) Login(email, password string) (userID, username string, verified bool, err error) {
