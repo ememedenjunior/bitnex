@@ -73,7 +73,7 @@ func (s *AuthService) Register(email, username, password string) (string, int64,
 	}
 
 	// create default accounts
-	assets := []string{"BITCOIN", "ETHEREUM", "BNB", "SOLANA", "XRP", "SUI"}
+	assets := []string{"BITCOIN", "ETHEREUM", "BNB", "SOLANA", "XRP", "SUI", "ALGORAND", "TRON"}
 	var account ledger.Ledger
 	account.Db = s.DB
 

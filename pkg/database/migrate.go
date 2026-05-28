@@ -16,6 +16,7 @@ func MigrateUser() {
 		username TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
 		is_verified BOOLEAN DEFAULT FALSE,
+		daily_open_equity NUMERIC(36,18) DEFAULT 0,
 		role TEXT DEFAULT 'user',
 		created_at TIMESTAMP DEFAULT NOW(),
 		updated_at TIMESTAMP DEFAULT NOW()

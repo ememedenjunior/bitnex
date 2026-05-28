@@ -1,8 +1,12 @@
 package handler
 
 import (
+	"context"
 	"cryptohub/auth"
 	"cryptohub/middlewares"
+	"database/sql"
+	"errors"
+	"log"
 
 	"github.com/gofiber/fiber/v2"
 )
@@ -43,6 +47,7 @@ func (h *AuthHandler) Register(c *fiber.Ctx) error {
 	}
 
 	e := middlewares.SendVerificationEmail(body.Email, token)
+	log.Println(e)
 	if e != nil {
 		h.Service.EventBus.Publish(
 			middlewares.UserRegistrationFailed,
@@ -300,5 +305,120 @@ func (h *AuthHandler) ResetPassword(c *fiber.Ctx) error {
 
 	return c.JSON(fiber.Map{
 		"message": "password reset successful",
+	})
+}
+
+func (h *AuthHandler) Profile(c *fiber.Ctx) error {
+	userID := c.Locals("userID")
+	ctx := context.Background()
+
+	// 1. Get user
+	var user struct {
+		Useruid           string `json:"user_uid"`
+		Email             string `json:"email"`
+		UserName          string `json:"username"`
+		IsVerified        bool   `json:"is_verified"`
+		Daily_Open_Equity int64  `json:"daily_open_equity"`
+	}
+
+	var err error
+
+	err = h.Service.DB.QueryRowContext(ctx, `
+		SELECT user_uid, email, username, is_verified
+		FROM users
+		WHERE user_uid = $1
+	`, userID).Scan(&user.Useruid, &user.Email, &user.UserName, &user.IsVerified)
+
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"message": "failed to fetch user",
+		})
+	}
+
+	// 2. Get account info
+	type Account struct {
+		Asset   string `json:"asset"`
+		Balance string `json:"balance"`
+	}
+
+	// 2. Get account info
+	rows, err := h.Service.DB.QueryContext(ctx, `
+		SELECT asset, balance
+		FROM accounts
+		WHERE user_uid = $1
+		`, user.Useruid)
+
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{
+			"message": "internal server error",
+		})
+	}
+	defer rows.Close()
+
+	accounts := []Account{}
+
+	for rows.Next() {
+		var account Account
+
+		err := rows.Scan(&account.Asset, &account.Balance)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{
+				"message": "failed to scan account",
+			})
+		}
+
+		accounts = append(accounts, account)
+	}
+
+	if len(accounts) == 0 {
+		return c.Status(404).JSON(fiber.Map{
+			"message": "accounts not found",
+		})
+	}
+
+	// 3. Get wallets
+	type wallet struct {
+		Address string `json:"address"`
+		Chain   string `json:"chain"`
+	}
+
+	rows, err = h.Service.DB.QueryContext(ctx, `
+			SELECT address, chain
+			FROM wallets
+			WHERE user_uid = $1
+		`, user.Useruid)
+
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			return c.Status(404).JSON(fiber.Map{
+				"message": "account not found",
+			})
+		default:
+			return c.Status(500).JSON(fiber.Map{
+				"message": "internal server error",
+			})
+		}
+	}
+	defer rows.Close()
+
+	var wallets []wallet
+
+	for rows.Next() {
+		var w wallet
+		err := rows.Scan(&w.Address, &w.Chain)
+		if err != nil {
+			return c.Status(500).JSON(fiber.Map{
+				"message": "failed to fetch wallets",
+			})
+		}
+		wallets = append(wallets, w)
+	}
+
+	// 4. Final response
+	return c.JSON(fiber.Map{
+		"user":    user,
+		"account": accounts,
+		"wallets": wallets,
 	})
 }

@@ -6,7 +6,7 @@ import (
 )
 
 const (
-	smtpHost = "smtp.gmail.com"
+	smtpHost = "smtp-relay.brevo.com"
 	smtpPort = "587"
 )
 
@@ -39,8 +39,8 @@ var (
 
 func SendVerificationEmail(toEmail, token string) error {
 
-	fromEmail = "simplyemem10@gmail.com"
-	password = "axxs toiw yxgv nykb"
+	fromEmail = "acd404001@smtp-brevo.com"
+	password = "xsmtpsib-e90a0b4cda3cfca6cdc84e5a431a47ed322f9270cf4ddd0124dbc29f171a5f6b-F7uteSL0RRLOUaiw"
 
 	subject := "Your Verification Code 🚀"
 

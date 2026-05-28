@@ -17,10 +17,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/algorand/go-algorand-sdk/client/v2/algod"
+	"github.com/algorand/go-algorand-sdk/client/v2/indexer"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/types"
+	ethTypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/fbsobreira/gotron-sdk/pkg/address"
+	"github.com/fbsobreira/gotron-sdk/pkg/client"
+	tronCommon "github.com/fbsobreira/gotron-sdk/pkg/common"
+	"github.com/fbsobreira/gotron-sdk/pkg/proto/api"
+	"github.com/fbsobreira/gotron-sdk/pkg/proto/core"
 	"github.com/gagliardetto/solana-go/rpc"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // ==================== RPC HEALTH CHECKER ====================
@@ -132,236 +141,20 @@ func (hc *RPCHealthChecker) RecordFailure(url string, err error) {
 	cb.Failures++
 	cb.LastFailure = time.Now()
 
-	// Open circuit after 3 failures
-	if cb.Failures >= 3 && cb.State == "CLOSED" {
+	// Open circuit after 5 failures
+	if cb.Failures >= 5 && cb.State == "CLOSED" {
 		cb.State = "OPEN"
 		status.Healthy = false
 		log.Printf("🔌 Circuit breaker for %s OPEN after %d failures", url, cb.Failures)
 	}
 
-	// Mark unhealthy after 2 failures
-	if status.FailureCount >= 2 {
+	// Mark unhealthy after 3 failures
+	if status.FailureCount >= 3 {
 		status.Healthy = false
 	}
 }
 
-// ==================== CHAIN ADAPTER INTERFACE ====================
-
-type ChainAdapter interface {
-	GetLatestState() (interface{}, error)
-	FetchTransactions(startBlock, endBlock interface{}) ([]Transaction, error)
-	ValidateResponse(response []byte) bool
-	SwitchRPC() error
-	GetName() string
-	GetRPCURL() string
-}
-
-type Transaction struct {
-	Hash        string
-	From        string
-	To          string
-	Amount      *big.Float
-	Asset       string
-	BlockNumber uint64
-	Timestamp   time.Time
-	Chain       string
-}
-
-// ==================== SUI ADAPTER WITH FIX ====================
-
-type SuiAdapter struct {
-	name          string
-	rpcURLs       []string
-	currentRPC    int
-	healthChecker *RPCHealthChecker
-	client        *http.Client
-	mu            sync.RWMutex
-}
-
-func NewSuiAdapter(rpcURLs []string) *SuiAdapter {
-	return &SuiAdapter{
-		name:          "Sui",
-		rpcURLs:       rpcURLs,
-		currentRPC:    0,
-		healthChecker: NewRPCHealthChecker(),
-		client:        &http.Client{Timeout: 30 * time.Second},
-	}
-}
-
-func (sa *SuiAdapter) GetName() string {
-	return sa.name
-}
-
-func (sa *SuiAdapter) GetRPCURL() string {
-	sa.mu.RLock()
-	defer sa.mu.RUnlock()
-	if len(sa.rpcURLs) == 0 {
-		return ""
-	}
-	return sa.rpcURLs[sa.currentRPC]
-}
-
-func (sa *SuiAdapter) SwitchRPC() error {
-	sa.mu.Lock()
-	defer sa.mu.Unlock()
-
-	if len(sa.rpcURLs) == 0 {
-		return fmt.Errorf("no RPC endpoints configured")
-	}
-
-	originalRPC := sa.currentRPC
-	for i := 0; i < len(sa.rpcURLs); i++ {
-		sa.currentRPC = (sa.currentRPC + 1) % len(sa.rpcURLs)
-		if sa.currentRPC != originalRPC {
-			log.Printf("🔄 Sui: Switching RPC from %s to %s",
-				sa.rpcURLs[originalRPC], sa.rpcURLs[sa.currentRPC])
-			return nil
-		}
-	}
-	return fmt.Errorf("no healthy Sui RPC endpoints available")
-}
-
-func (sa *SuiAdapter) GetLatestCheckpoint() (int64, error) {
-	url := sa.GetRPCURL()
-	if url == "" {
-		return 0, fmt.Errorf("no RPC URL available")
-	}
-
-	if !sa.healthChecker.CheckEndpoint(url) {
-		if err := sa.SwitchRPC(); err != nil {
-			return 0, err
-		}
-		url = sa.GetRPCURL()
-	}
-
-	// Correct JSON-RPC request for Sui
-	request := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "sui_getLatestCheckpointSequenceNumber",
-		"params":  []interface{}{},
-	}
-
-	startTime := time.Now()
-	response, err := sa.makeRequest(url, request)
-	if err != nil {
-		sa.healthChecker.RecordFailure(url, err)
-		sa.SwitchRPC()
-		return 0, fmt.Errorf("failed to get latest checkpoint: %w", err)
-	}
-
-	// Validate response is not HTML
-	if !sa.ValidateResponse(response) {
-		err := fmt.Errorf("invalid response format (HTML or malformed JSON)")
-		sa.healthChecker.RecordFailure(url, err)
-		sa.SwitchRPC()
-		return 0, err
-	}
-
-	sa.healthChecker.RecordSuccess(url, time.Since(startTime))
-
-	// Parse response
-	var rpcResponse struct {
-		Result int64 `json:"result"`
-		Error  struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-
-	if err := json.Unmarshal(response, &rpcResponse); err != nil {
-		return 0, fmt.Errorf("failed to unmarshal response: %w", err)
-	}
-
-	if rpcResponse.Error.Code != 0 {
-		return 0, fmt.Errorf("RPC error: %s", rpcResponse.Error.Message)
-	}
-
-	return rpcResponse.Result, nil
-}
-
-func (sa *SuiAdapter) GetCheckpoint(checkpoint int64) (map[string]interface{}, error) {
-	url := sa.GetRPCURL()
-	if url == "" {
-		return nil, fmt.Errorf("no RPC URL available")
-	}
-
-	request := map[string]interface{}{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "sui_getCheckpoint",
-		"params":  []interface{}{checkpoint},
-	}
-
-	response, err := sa.makeRequest(url, request)
-	if err != nil {
-		return nil, err
-	}
-
-	if !sa.ValidateResponse(response) {
-		return nil, fmt.Errorf("invalid response format")
-	}
-
-	var rpcResponse struct {
-		Result map[string]interface{} `json:"result"`
-		Error  struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-
-	if err := json.Unmarshal(response, &rpcResponse); err != nil {
-		return nil, err
-	}
-
-	if rpcResponse.Error.Message != "" {
-		return nil, fmt.Errorf("RPC error: %s", rpcResponse.Error.Message)
-	}
-
-	return rpcResponse.Result, nil
-}
-
-func (sa *SuiAdapter) makeRequest(url string, request interface{}) ([]byte, error) {
-	body, err := json.Marshal(request)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := sa.client.Post(url, "application/json", bytes.NewBuffer(body))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	return io.ReadAll(resp.Body)
-}
-
-func (sa *SuiAdapter) ValidateResponse(response []byte) bool {
-	// Check for HTML response
-	responseStr := string(response)
-	if strings.Contains(responseStr, "<!DOCTYPE") ||
-		strings.Contains(responseStr, "<html") ||
-		strings.Contains(responseStr, "HTML") {
-		return false
-	}
-
-	// Check if it's valid JSON
-	var js interface{}
-	if err := json.Unmarshal(response, &js); err != nil {
-		return false
-	}
-
-	return true
-}
-
-func (sa *SuiAdapter) GetLatestState() (interface{}, error) {
-	return sa.GetLatestCheckpoint()
-}
-
-func (sa *SuiAdapter) FetchTransactions(startBlock, endBlock interface{}) ([]Transaction, error) {
-	return []Transaction{}, nil
-}
-
-// ==================== XRP ADAPTER WITH LEDGER FIX ====================
+// ==================== XRP ADAPTER ====================
 
 type XRPAdapter struct {
 	name          string
@@ -439,31 +232,13 @@ func (xa *XRPAdapter) GetAccountTransactions(address string, minLedger, maxLedge
 		url = xa.GetRPCURL()
 	}
 
-	// Normalize ledger indices - FIX for lgrIdxsInvalid
-	normalizedMin := minLedger
-	normalizedMax := maxLedger
-
-	// Fix: Ensure min <= max unless max = -1
-	if normalizedMax != -1 && normalizedMin > normalizedMax {
-		log.Printf("⚠️ XRP: Swapping invalid ledger range (min=%d, max=%d)", normalizedMin, normalizedMax)
-		normalizedMin, normalizedMax = normalizedMax, normalizedMin
-	}
-
-	// Fix: Set invalid or negative indices to -1 (latest)
-	if normalizedMin < 0 {
-		normalizedMin = -1
-	}
-	if normalizedMax < 0 {
-		normalizedMax = -1
-	}
-
 	request := map[string]interface{}{
 		"method": "account_tx",
 		"params": []interface{}{
 			map[string]interface{}{
 				"account":          address,
-				"ledger_index_min": normalizedMin,
-				"ledger_index_max": normalizedMax,
+				"ledger_index_min": minLedger,
+				"ledger_index_max": maxLedger,
 				"limit":            200,
 				"binary":           false,
 			},
@@ -487,7 +262,6 @@ func (xa *XRPAdapter) GetAccountTransactions(address string, minLedger, maxLedge
 
 	xa.healthChecker.RecordSuccess(url, time.Since(startTime))
 
-	// Parse response
 	var rpcResponse struct {
 		Result struct {
 			Transactions []struct {
@@ -562,15 +336,7 @@ func (xa *XRPAdapter) ValidateResponse(response []byte) bool {
 	return true
 }
 
-func (xa *XRPAdapter) GetLatestState() (interface{}, error) {
-	return nil, nil
-}
-
-func (xa *XRPAdapter) FetchTransactions(startBlock, endBlock interface{}) ([]Transaction, error) {
-	return []Transaction{}, nil
-}
-
-// ==================== BITCOIN ADAPTER WITH REST API FIX ====================
+// ==================== BITCOIN ADAPTER ====================
 
 type BitcoinAdapter struct {
 	name          string
@@ -637,129 +403,56 @@ func (ba *BitcoinAdapter) GetBlockCount() (int64, error) {
 		url = ba.GetRPCURL()
 	}
 
-	// Bitcoin REST API endpoint for block height
-	restURL := strings.TrimSuffix(url, "/") + "/blocks/tip/height"
-
-	startTime := time.Now()
-	req, err := http.NewRequest("GET", restURL, nil)
-	if err != nil {
-		return 0, err
+	restURLs := []string{
+		strings.TrimSuffix(url, "/") + "/blocks/tip/height",
+		strings.TrimSuffix(url, "/") + "/api/blocks/tip/height",
+		strings.TrimSuffix(url, "/") + "/q/getblockcount",
 	}
 
-	resp, err := ba.client.Do(req)
-	if err != nil {
-		ba.healthChecker.RecordFailure(url, err)
-		ba.SwitchRPC()
-		return 0, err
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for _, restURL := range restURLs {
+		startTime := time.Now()
+		req, err := http.NewRequest("GET", restURL, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, err
-	}
+		resp, err := ba.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		defer resp.Body.Close()
 
-	// Validate response is not HTML
-	if !ba.ValidateResponse(body) {
-		err := fmt.Errorf("invalid HTML response from Bitcoin API")
-		ba.healthChecker.RecordFailure(url, err)
-		ba.SwitchRPC()
-		return 0, err
-	}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			lastErr = err
+			continue
+		}
 
-	ba.healthChecker.RecordSuccess(url, time.Since(startTime))
-
-	// Parse JSON response
-	var height int64
-	if err := json.Unmarshal(body, &height); err != nil {
-		return 0, fmt.Errorf("failed to parse block height: %w", err)
-	}
-
-	return height, nil
-}
-
-func (ba *BitcoinAdapter) GetBlockHash(height int64) (string, error) {
-	url := ba.GetRPCURL()
-	if url == "" {
-		return "", fmt.Errorf("no RPC URL available")
+		if ba.ValidateResponse(body) {
+			var height int64
+			if err := json.Unmarshal(body, &height); err == nil {
+				ba.healthChecker.RecordSuccess(url, time.Since(startTime))
+				return height, nil
+			}
+		}
 	}
 
-	restURL := strings.TrimSuffix(url, "/") + fmt.Sprintf("/block-height/%d", height)
-
-	req, err := http.NewRequest("GET", restURL, nil)
-	if err != nil {
-		return "", err
-	}
-
-	resp, err := ba.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-
-	if !ba.ValidateResponse(body) {
-		return "", fmt.Errorf("invalid response format")
-	}
-
-	var blockHash string
-	if err := json.Unmarshal(body, &blockHash); err != nil {
-		return "", err
-	}
-
-	return blockHash, nil
-}
-
-func (ba *BitcoinAdapter) GetBlock(blockHash string) (map[string]interface{}, error) {
-	url := ba.GetRPCURL()
-	if url == "" {
-		return nil, fmt.Errorf("no RPC URL available")
-	}
-
-	restURL := strings.TrimSuffix(url, "/") + fmt.Sprintf("/block/%s", blockHash)
-
-	req, err := http.NewRequest("GET", restURL, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := ba.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	if !ba.ValidateResponse(body) {
-		return nil, fmt.Errorf("invalid response format")
-	}
-
-	var block map[string]interface{}
-	if err := json.Unmarshal(body, &block); err != nil {
-		return nil, err
-	}
-
-	return block, nil
+	ba.healthChecker.RecordFailure(url, lastErr)
+	ba.SwitchRPC()
+	return 0, fmt.Errorf("failed to get block height: %w", lastErr)
 }
 
 func (ba *BitcoinAdapter) ValidateResponse(response []byte) bool {
 	responseStr := string(response)
-	// Check for HTML error pages
 	if strings.Contains(responseStr, "<!DOCTYPE") ||
 		strings.Contains(responseStr, "<html") ||
 		strings.Contains(responseStr, "HTML") {
 		return false
 	}
 
-	// Should be valid JSON
 	var js interface{}
 	if err := json.Unmarshal(response, &js); err != nil {
 		return false
@@ -768,15 +461,7 @@ func (ba *BitcoinAdapter) ValidateResponse(response []byte) bool {
 	return true
 }
 
-func (ba *BitcoinAdapter) GetLatestState() (interface{}, error) {
-	return ba.GetBlockCount()
-}
-
-func (ba *BitcoinAdapter) FetchTransactions(startBlock, endBlock interface{}) ([]Transaction, error) {
-	return []Transaction{}, nil
-}
-
-// ==================== BNB ADAPTER WITH DNS TIMEOUT FIX ====================
+// ==================== BNB ADAPTER ====================
 
 type BNBAdapter struct {
 	name          string
@@ -840,7 +525,7 @@ func (ba *BNBAdapter) SwitchRPC() error {
 }
 
 func (ba *BNBAdapter) DialWithRetry() (*ethclient.Client, error) {
-	var client *ethclient.Client
+	var ethClient *ethclient.Client
 	var err error
 
 	backoff := 2 * time.Second
@@ -859,14 +544,12 @@ func (ba *BNBAdapter) DialWithRetry() (*ethclient.Client, error) {
 			url = ba.GetRPCURL()
 		}
 
-		// Test DNS resolution first
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 
-		// Try to dial with timeout
-		client, err = ethclient.DialContext(ctx, url)
+		ethClient, err = ethclient.DialContext(ctx, url)
+		cancel()
+
 		if err != nil {
-			// Check if it's a DNS error
 			if strings.Contains(err.Error(), "no such host") ||
 				strings.Contains(err.Error(), "i/o timeout") ||
 				strings.Contains(err.Error(), "dial tcp: lookup") {
@@ -874,7 +557,6 @@ func (ba *BNBAdapter) DialWithRetry() (*ethclient.Client, error) {
 				ba.healthChecker.RecordFailure(url, err)
 				ba.SwitchRPC()
 
-				// Exponential backoff before retry
 				time.Sleep(backoff)
 				backoff = time.Duration(float64(backoff) * 2)
 				if backoff > maxBackoff {
@@ -885,75 +567,464 @@ func (ba *BNBAdapter) DialWithRetry() (*ethclient.Client, error) {
 			return nil, err
 		}
 
-		// Test connection
 		ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
+		_, err = ethClient.BlockNumber(ctx)
+		cancel()
 
-		_, err = client.BlockNumber(ctx)
 		if err != nil {
-			client.Close()
+			ethClient.Close()
 			ba.healthChecker.RecordFailure(url, err)
 			ba.SwitchRPC()
 			continue
 		}
 
 		ba.healthChecker.RecordSuccess(url, 0)
-		return client, nil
+		return ethClient, nil
 	}
 
 	return nil, fmt.Errorf("failed to connect to BNB after multiple retries: %w", err)
 }
 
-func (ba *BNBAdapter) GetLatestState() (interface{}, error) {
-	client, err := ba.DialWithRetry()
+// ==================== ALGORAND ADAPTER ====================
+
+type AlgorandAdapter struct {
+	name          string
+	algodURLs     []string
+	currentRPC    int
+	healthChecker *RPCHealthChecker
+	clients       []*algod.Client
+	mu            sync.RWMutex
+}
+
+func NewAlgorandAdapter(algodURLs []string) *AlgorandAdapter {
+	adapter := &AlgorandAdapter{
+		name:          "Algorand",
+		algodURLs:     algodURLs,
+		currentRPC:    0,
+		healthChecker: NewRPCHealthChecker(),
+		clients:       make([]*algod.Client, len(algodURLs)),
+	}
+
+	for i, url := range algodURLs {
+		client, err := algod.MakeClient(url, "")
+		if err != nil {
+			log.Printf("⚠️ Failed to create Algorand client for %s: %v", url, err)
+			continue
+		}
+		adapter.clients[i] = client
+	}
+
+	return adapter
+}
+
+func (aa *AlgorandAdapter) GetName() string {
+	return aa.name
+}
+
+func (aa *AlgorandAdapter) GetRPCURL() string {
+	aa.mu.RLock()
+	defer aa.mu.RUnlock()
+	if len(aa.algodURLs) == 0 {
+		return ""
+	}
+	return aa.algodURLs[aa.currentRPC]
+}
+
+func (aa *AlgorandAdapter) GetClient() *algod.Client {
+	aa.mu.RLock()
+	defer aa.mu.RUnlock()
+	if len(aa.clients) == 0 || aa.currentRPC >= len(aa.clients) {
+		return nil
+	}
+	return aa.clients[aa.currentRPC]
+}
+
+func (aa *AlgorandAdapter) SwitchRPC() error {
+	aa.mu.Lock()
+	defer aa.mu.Unlock()
+
+	if len(aa.algodURLs) == 0 {
+		return fmt.Errorf("no RPC endpoints configured")
+	}
+
+	originalRPC := aa.currentRPC
+	for i := 0; i < len(aa.algodURLs); i++ {
+		aa.currentRPC = (aa.currentRPC + 1) % len(aa.algodURLs)
+		if aa.currentRPC != originalRPC && aa.clients[aa.currentRPC] != nil {
+			log.Printf("🔄 Algorand: Switching RPC from %s to %s",
+				aa.algodURLs[originalRPC], aa.algodURLs[aa.currentRPC])
+			return nil
+		}
+	}
+	return fmt.Errorf("no healthy Algorand RPC endpoints available")
+}
+
+func (aa *AlgorandAdapter) GetLatestBlock() (uint64, error) {
+	client := aa.GetClient()
+	if client == nil {
+		return 0, fmt.Errorf("no client available")
+	}
+
+	if !aa.healthChecker.CheckEndpoint(aa.GetRPCURL()) {
+		if err := aa.SwitchRPC(); err != nil {
+			return 0, err
+		}
+		client = aa.GetClient()
+	}
+
+	startTime := time.Now()
+	status, err := client.Status().Do(context.Background())
+	if err != nil {
+		aa.healthChecker.RecordFailure(aa.GetRPCURL(), err)
+		aa.SwitchRPC()
+		return 0, fmt.Errorf("failed to get status: %w", err)
+	}
+
+	aa.healthChecker.RecordSuccess(aa.GetRPCURL(), time.Since(startTime))
+	return uint64(status.LastRound), nil
+}
+
+// ==================== TRON ADAPTER ====================
+
+type TronAdapter struct {
+	name          string
+	grpcURLs      []string
+	currentRPC    int
+	healthChecker *RPCHealthChecker
+	clients       []*client.GrpcClient
+	mu            sync.RWMutex
+}
+
+func NewTronAdapter(grpcURLs []string) *TronAdapter {
+	adapter := &TronAdapter{
+		name:          "Tron",
+		grpcURLs:      grpcURLs,
+		currentRPC:    0,
+		healthChecker: NewRPCHealthChecker(),
+		clients:       make([]*client.GrpcClient, len(grpcURLs)),
+	}
+
+	for i, url := range grpcURLs {
+		grpcClient := client.NewGrpcClient(url)
+		err := grpcClient.Start(grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			log.Printf("⚠️ Failed to create Tron client for %s: %v", url, err)
+			continue
+		}
+		adapter.clients[i] = grpcClient
+	}
+
+	return adapter
+}
+
+func (ta *TronAdapter) GetName() string {
+	return ta.name
+}
+
+func (ta *TronAdapter) GetRPCURL() string {
+	ta.mu.RLock()
+	defer ta.mu.RUnlock()
+	if len(ta.grpcURLs) == 0 {
+		return ""
+	}
+	return ta.grpcURLs[ta.currentRPC]
+}
+
+func (ta *TronAdapter) GetClient() *client.GrpcClient {
+	ta.mu.RLock()
+	defer ta.mu.RUnlock()
+	if len(ta.clients) == 0 || ta.currentRPC >= len(ta.clients) {
+		return nil
+	}
+	return ta.clients[ta.currentRPC]
+}
+
+func (ta *TronAdapter) SwitchRPC() error {
+	ta.mu.Lock()
+	defer ta.mu.Unlock()
+
+	if len(ta.grpcURLs) == 0 {
+		return fmt.Errorf("no RPC endpoints configured")
+	}
+
+	originalRPC := ta.currentRPC
+	for i := 0; i < len(ta.grpcURLs); i++ {
+		ta.currentRPC = (ta.currentRPC + 1) % len(ta.grpcURLs)
+		if ta.currentRPC != originalRPC && ta.clients[ta.currentRPC] != nil {
+			log.Printf("🔄 Tron: Switching RPC from %s to %s",
+				ta.grpcURLs[originalRPC], ta.grpcURLs[ta.currentRPC])
+			return nil
+		}
+	}
+	return fmt.Errorf("no healthy Tron RPC endpoints available")
+}
+
+func (ta *TronAdapter) GetLatestBlock() (int64, error) {
+	client := ta.GetClient()
+	if client == nil {
+		return 0, fmt.Errorf("no client available")
+	}
+
+	if !ta.healthChecker.CheckEndpoint(ta.GetRPCURL()) {
+		if err := ta.SwitchRPC(); err != nil {
+			return 0, err
+		}
+		client = ta.GetClient()
+	}
+
+	startTime := time.Now()
+	block, err := client.GetNowBlock()
+	if err != nil {
+		ta.healthChecker.RecordFailure(ta.GetRPCURL(), err)
+		ta.SwitchRPC()
+		return 0, fmt.Errorf("failed to get latest block: %w", err)
+	}
+
+	ta.healthChecker.RecordSuccess(ta.GetRPCURL(), time.Since(startTime))
+	return block.GetBlockHeader().GetRawData().GetNumber(), nil
+}
+
+func (ta *TronAdapter) GetBlockByNumber(blockNumber int64) (*api.BlockExtention, error) {
+	client := ta.GetClient()
+	if client == nil {
+		return nil, fmt.Errorf("no client available")
+	}
+
+	block, err := client.GetBlockByNum(blockNumber)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get block: %w", err)
+	}
+
+	return block, nil
+}
+
+func (ta *TronAdapter) GetTransactionByID(txID string) (*core.Transaction, error) {
+	client := ta.GetClient()
+	if client == nil {
+		return nil, fmt.Errorf("no client available")
+	}
+
+	tx, err := client.GetTransactionByID(txID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get transaction: %w", err)
+	}
+
+	return tx, nil
+}
+
+// ==================== SUI ADAPTER ====================
+
+type SuiAdapter struct {
+	name          string
+	rpcURLs       []string
+	currentRPC    int
+	healthChecker *RPCHealthChecker
+	client        *http.Client
+	mu            sync.RWMutex
+}
+
+func NewSuiAdapter(rpcURLs []string) *SuiAdapter {
+	return &SuiAdapter{
+		name:          "Sui",
+		rpcURLs:       rpcURLs,
+		currentRPC:    0,
+		healthChecker: NewRPCHealthChecker(),
+		client:        &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+func (sa *SuiAdapter) GetName() string {
+	return sa.name
+}
+
+func (sa *SuiAdapter) GetRPCURL() string {
+	sa.mu.RLock()
+	defer sa.mu.RUnlock()
+	if len(sa.rpcURLs) == 0 {
+		return ""
+	}
+	return sa.rpcURLs[sa.currentRPC]
+}
+
+func (sa *SuiAdapter) SwitchRPC() error {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+
+	if len(sa.rpcURLs) == 0 {
+		return fmt.Errorf("no RPC endpoints configured")
+	}
+
+	originalRPC := sa.currentRPC
+	for i := 0; i < len(sa.rpcURLs); i++ {
+		sa.currentRPC = (sa.currentRPC + 1) % len(sa.rpcURLs)
+		if sa.currentRPC != originalRPC {
+			log.Printf("🔄 Sui: Switching RPC from %s to %s",
+				sa.rpcURLs[originalRPC], sa.rpcURLs[sa.currentRPC])
+			return nil
+		}
+	}
+	return fmt.Errorf("no healthy Sui RPC endpoints available")
+}
+
+func (sa *SuiAdapter) GetLatestCheckpoint() (int64, error) {
+	url := sa.GetRPCURL()
+	if url == "" {
+		return 0, fmt.Errorf("no RPC URL available")
+	}
+
+	if !sa.healthChecker.CheckEndpoint(url) {
+		if err := sa.SwitchRPC(); err != nil {
+			return 0, err
+		}
+		url = sa.GetRPCURL()
+	}
+
+	request := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "sui_getLatestCheckpointSequenceNumber",
+		"params":  []interface{}{},
+	}
+
+	startTime := time.Now()
+	response, err := sa.makeRequest(url, request)
+	if err != nil {
+		sa.healthChecker.RecordFailure(url, err)
+		sa.SwitchRPC()
+		return 0, fmt.Errorf("failed to get latest checkpoint: %w", err)
+	}
+
+	if !sa.ValidateResponse(response) {
+		err := fmt.Errorf("invalid response format (HTML or malformed JSON)")
+		sa.healthChecker.RecordFailure(url, err)
+		sa.SwitchRPC()
+		return 0, err
+	}
+
+	sa.healthChecker.RecordSuccess(url, time.Since(startTime))
+
+	var rpcResponse struct {
+		Result int64 `json:"result"`
+		Error  struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal(response, &rpcResponse); err != nil {
+		return 0, fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	if rpcResponse.Error.Code != 0 {
+		return 0, fmt.Errorf("RPC error: %s", rpcResponse.Error.Message)
+	}
+
+	return rpcResponse.Result, nil
+}
+
+func (sa *SuiAdapter) GetCheckpoint(checkpoint int64) (map[string]interface{}, error) {
+	url := sa.GetRPCURL()
+	if url == "" {
+		return nil, fmt.Errorf("no RPC URL available")
+	}
+
+	request := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "sui_getCheckpoint",
+		"params":  []interface{}{checkpoint},
+	}
+
+	response, err := sa.makeRequest(url, request)
 	if err != nil {
 		return nil, err
 	}
-	defer client.Close()
 
-	return client.BlockNumber(context.Background())
+	if !sa.ValidateResponse(response) {
+		return nil, fmt.Errorf("invalid response format")
+	}
+
+	var rpcResponse struct {
+		Result map[string]interface{} `json:"result"`
+		Error  struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+
+	if err := json.Unmarshal(response, &rpcResponse); err != nil {
+		return nil, err
+	}
+
+	if rpcResponse.Error.Message != "" {
+		return nil, fmt.Errorf("RPC error: %s", rpcResponse.Error.Message)
+	}
+
+	return rpcResponse.Result, nil
 }
 
-func (ba *BNBAdapter) FetchTransactions(startBlock, endBlock interface{}) ([]Transaction, error) {
-	return []Transaction{}, nil
+func (sa *SuiAdapter) makeRequest(url string, request interface{}) ([]byte, error) {
+	body, err := json.Marshal(request)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := sa.client.Post(url, "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	return io.ReadAll(resp.Body)
 }
 
-func (ba *BNBAdapter) ValidateResponse(response []byte) bool {
+func (sa *SuiAdapter) ValidateResponse(response []byte) bool {
+	responseStr := string(response)
+	if strings.Contains(responseStr, "<!DOCTYPE") ||
+		strings.Contains(responseStr, "<html") ||
+		strings.Contains(responseStr, "HTML") {
+		return false
+	}
+
+	var js interface{}
+	if err := json.Unmarshal(response, &js); err != nil {
+		return false
+	}
+
 	return true
 }
 
 // ==================== DEPOSIT WATCHER CONFIG ====================
 
 type WatcherConfig struct {
-	// Ethereum config
 	EthereumRPCURL        string
 	EthereumStartBlock    uint64
 	EthereumCheckInterval time.Duration
 
-	// Solana config
 	SolanaRPCURL        string
 	SolanaCheckInterval time.Duration
 	SolanaCommitment    rpc.CommitmentType
 
-	// Bitcoin config
 	BitcoinRPCURL        string
 	BitcoinRPCUser       string
 	BitcoinRPCPassword   string
 	BitcoinCheckInterval time.Duration
 
-	// BNB config (same as Ethereum)
 	BNBRPCURL     string
 	BNBStartBlock uint64
 
-	// Sui config
 	SuiRPCURL        string
 	SuiCheckInterval time.Duration
 
-	// XRP config
 	XRPRPCURL        string
 	XRPCheckInterval time.Duration
 
-	// General config
+	AlgorandRPCURLs       []string
+	AlgorandIndexerURLs   []string
+	AlgorandCheckInterval time.Duration
+
+	TronRPCURLs       []string
+	TronCheckInterval time.Duration
+
 	MaxConfirmations uint64
 	WorkerCount      int
 	RetryAttempts    int
@@ -961,8 +1032,6 @@ type WatcherConfig struct {
 	RetryBackoff     float64
 	CacheTTL         time.Duration
 }
-
-// ==================== DEPOSIT STRUCT ====================
 
 type Deposit struct {
 	Chain         string
@@ -978,8 +1047,6 @@ type Deposit struct {
 	Reference     string
 }
 
-// ==================== ENHANCED DEPOSIT WATCHER ====================
-
 type EnhancedDepositWatcher struct {
 	db             *sql.DB
 	ledger         *ledger.Ledger
@@ -991,18 +1058,18 @@ type EnhancedDepositWatcher struct {
 	mu             sync.RWMutex
 	processedCache sync.Map
 
-	// Chain adapters
-	suiAdapter     *SuiAdapter
-	xrpAdapter     *XRPAdapter
-	bitcoinAdapter *BitcoinAdapter
-	bnbAdapter     *BNBAdapter
+	suiAdapter      *SuiAdapter
+	xrpAdapter      *XRPAdapter
+	bitcoinAdapter  *BitcoinAdapter
+	bnbAdapter      *BNBAdapter
+	algorandAdapter *AlgorandAdapter
+	algorandIndexer *indexer.Client
+	tronAdapter     *TronAdapter
 
 	healthChecker *RPCHealthChecker
 }
 
-// Updated RPC endpoints per chain
 var (
-	// Sui Mainnet endpoints
 	SuiRPCEndpoints = []string{
 		"https://fullnode.mainnet.sui.io:443",
 		"https://sui-mainnet.public.blastapi.io",
@@ -1010,7 +1077,6 @@ var (
 		"https://sui.api.metalamp.io",
 	}
 
-	// XRP Mainnet endpoints
 	XRPRPCEndpoints = []string{
 		"https://xrplcluster.com",
 		"https://xrpl.ws",
@@ -1018,14 +1084,12 @@ var (
 		"https://xrpl.link",
 	}
 
-	// Bitcoin Mainnet endpoints (REST API)
 	BitcoinRPCEndpoints = []string{
 		"https://blockchain.info",
 		"https://blockstream.info/api",
 		"https://mempool.space/api",
 	}
 
-	// BNB Smart Chain endpoints
 	BNBRPCEndpoints = []string{
 		"https://bsc-dataseed1.binance.org",
 		"https://bsc-dataseed2.binance.org",
@@ -1033,6 +1097,25 @@ var (
 		"https://bsc-dataseed4.binance.org",
 		"https://bsc-dataseed1.defibit.io",
 		"https://bsc-dataseed2.defibit.io",
+	}
+
+	AlgorandRPCEndpoints = []string{
+		"https://mainnet-api.algonode.cloud",
+		"https://algoexplorerapi.io",
+		"https://mainnet.algorand.se",
+		"https://mainnet-api.algorand.network",
+	}
+
+	AlgorandIndexerEndpoints = []string{
+		"https://mainnet-idx.algonode.cloud",
+		"https://algoexplorerapi.io/idx2",
+		"https://indexer.algorand.se",
+	}
+
+	TronGRPCEndpoints = []string{
+		"grpc.trongrid.io:50051",
+		"grpc.tronstack.io:50051",
+		"grpc.trxplaza.io:50051",
 	}
 )
 
@@ -1044,11 +1127,28 @@ func NewEnhancedDepositWatcher(
 ) *EnhancedDepositWatcher {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Initialize adapters with fallback endpoints
 	suiAdapter := NewSuiAdapter(SuiRPCEndpoints)
 	xrpAdapter := NewXRPAdapter(XRPRPCEndpoints)
 	bitcoinAdapter := NewBitcoinAdapter(BitcoinRPCEndpoints)
 	bnbAdapter := NewBNBAdapter(BNBRPCEndpoints)
+	algorandAdapter := NewAlgorandAdapter(AlgorandRPCEndpoints)
+	tronAdapter := NewTronAdapter(TronGRPCEndpoints)
+
+	// Initialize Algorand Indexer client
+	var algorandIndexer *indexer.Client
+	for _, idxURL := range AlgorandIndexerEndpoints {
+		idxClient, err := indexer.MakeClient(idxURL, "")
+		if err == nil {
+			algorandIndexer = idxClient
+			log.Printf("✅ Connected to Algorand Indexer at %s", idxURL)
+			break
+		}
+		log.Printf("⚠️ Failed to create Algorand Indexer client for %s: %v", idxURL, err)
+	}
+
+	if algorandIndexer == nil {
+		log.Printf("⚠️ No Algorand Indexer endpoints available, will use algod only for basic monitoring")
+	}
 
 	if config.WorkerCount == 0 {
 		config.WorkerCount = 5
@@ -1068,19 +1168,43 @@ func NewEnhancedDepositWatcher(
 	if config.CacheTTL == 0 {
 		config.CacheTTL = 24 * time.Hour
 	}
+	if config.AlgorandCheckInterval == 0 {
+		config.AlgorandCheckInterval = 10 * time.Second
+	}
+	if config.TronCheckInterval == 0 {
+		config.TronCheckInterval = 10 * time.Second
+	}
+	if config.EthereumCheckInterval == 0 {
+		config.EthereumCheckInterval = 10 * time.Second
+	}
+	if config.SolanaCheckInterval == 0 {
+		config.SolanaCheckInterval = 10 * time.Second
+	}
+	if config.BitcoinCheckInterval == 0 {
+		config.BitcoinCheckInterval = 30 * time.Second
+	}
+	if config.SuiCheckInterval == 0 {
+		config.SuiCheckInterval = 10 * time.Second
+	}
+	if config.XRPCheckInterval == 0 {
+		config.XRPCheckInterval = 10 * time.Second
+	}
 
 	return &EnhancedDepositWatcher{
-		db:             db,
-		ledger:         ledger,
-		walletManager:  walletManager,
-		config:         config,
-		ctx:            ctx,
-		cancel:         cancel,
-		suiAdapter:     suiAdapter,
-		xrpAdapter:     xrpAdapter,
-		bitcoinAdapter: bitcoinAdapter,
-		bnbAdapter:     bnbAdapter,
-		healthChecker:  NewRPCHealthChecker(),
+		db:              db,
+		ledger:          ledger,
+		walletManager:   walletManager,
+		config:          config,
+		ctx:             ctx,
+		cancel:          cancel,
+		suiAdapter:      suiAdapter,
+		xrpAdapter:      xrpAdapter,
+		bitcoinAdapter:  bitcoinAdapter,
+		bnbAdapter:      bnbAdapter,
+		algorandAdapter: algorandAdapter,
+		algorandIndexer: algorandIndexer,
+		tronAdapter:     tronAdapter,
+		healthChecker:   NewRPCHealthChecker(),
 	}
 }
 
@@ -1089,7 +1213,6 @@ func (dw *EnhancedDepositWatcher) Start() error {
 		return fmt.Errorf("failed to init deposit tables: %w", err)
 	}
 
-	// Start watchers with enhanced error recovery
 	chains := []struct {
 		name    string
 		watcher func() error
@@ -1100,6 +1223,8 @@ func (dw *EnhancedDepositWatcher) Start() error {
 		{"BNB", dw.watchBNB},
 		{"Ethereum", dw.watchEthereum},
 		{"Solana", dw.watchSolana},
+		{"Algorand", dw.watchAlgorand},
+		{"Tron", dw.watchTron},
 	}
 
 	for _, chain := range chains {
@@ -1125,13 +1250,11 @@ func (dw *EnhancedDepositWatcher) Start() error {
 							chainName, retryCount, err, backoff)
 						time.Sleep(backoff)
 
-						// Exponential backoff with max limit
 						backoff = time.Duration(float64(backoff) * 1.5)
 						if backoff > maxBackoff {
 							backoff = maxBackoff
 						}
 
-						// After 3 failures, try switching RPC
 						if retryCount >= 3 {
 							switch chainName {
 							case "Sui":
@@ -1142,8 +1265,12 @@ func (dw *EnhancedDepositWatcher) Start() error {
 								dw.bitcoinAdapter.SwitchRPC()
 							case "BNB":
 								dw.bnbAdapter.SwitchRPC()
+							case "Algorand":
+								dw.algorandAdapter.SwitchRPC()
+							case "Tron":
+								dw.tronAdapter.SwitchRPC()
 							}
-							retryCount = 0 // Reset after switch
+							retryCount = 0
 						}
 					} else {
 						retryCount = 0
@@ -1163,8 +1290,6 @@ func (dw *EnhancedDepositWatcher) Stop() {
 	dw.wg.Wait()
 	log.Println("All deposit watchers stopped")
 }
-
-// ==================== DATABASE INITIALIZATION ====================
 
 func (dw *EnhancedDepositWatcher) initDepositTables() error {
 	queries := []string{
@@ -1186,18 +1311,15 @@ func (dw *EnhancedDepositWatcher) initDepositTables() error {
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(chain, tx_hash)
 		)`,
-
 		`CREATE INDEX IF NOT EXISTS idx_deposits_user_id ON deposits(user_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status)`,
 		`CREATE INDEX IF NOT EXISTS idx_deposits_chain_tx ON deposits(chain, tx_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_deposits_to_address ON deposits(to_address)`,
-
 		`CREATE TABLE IF NOT EXISTS processed_blocks (
 			chain VARCHAR(50) PRIMARY KEY,
 			last_block_processed BIGINT NOT NULL,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS deposit_events (
 			id SERIAL PRIMARY KEY,
 			chain VARCHAR(50) NOT NULL,
@@ -1209,16 +1331,24 @@ func (dw *EnhancedDepositWatcher) initDepositTables() error {
 			processed_at TIMESTAMP,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS processed_checkpoints (
 			chain VARCHAR(50) PRIMARY KEY,
 			last_checkpoint BIGINT NOT NULL,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
-
 		`CREATE TABLE IF NOT EXISTS processed_ledgers (
 			chain VARCHAR(50) PRIMARY KEY,
 			last_ledger BIGINT NOT NULL,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS processed_rounds (
+			chain VARCHAR(50) PRIMARY KEY,
+			last_round BIGINT NOT NULL,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS processed_tron_blocks (
+			chain VARCHAR(50) PRIMARY KEY,
+			last_block BIGINT NOT NULL,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)`,
 	}
@@ -1231,8 +1361,6 @@ func (dw *EnhancedDepositWatcher) initDepositTables() error {
 
 	return nil
 }
-
-// ==================== ENHANCED CHAIN WATCHERS ====================
 
 func (dw *EnhancedDepositWatcher) watchSui() error {
 	latestCheckpoint, err := dw.suiAdapter.GetLatestCheckpoint()
@@ -1269,7 +1397,6 @@ func (dw *EnhancedDepositWatcher) watchSui() error {
 			log.Printf("Error processing Sui checkpoint %d: %v", checkpoint, err)
 			continue
 		}
-
 		if err := dw.updateLastProcessedCheckpoint(hdwallet.ChainSui, checkpoint); err != nil {
 			log.Printf("Failed to update last processed checkpoint: %v", err)
 		}
@@ -1294,12 +1421,9 @@ func (dw *EnhancedDepositWatcher) processSuiCheckpoint(checkpoint int64, address
 		if !ok {
 			continue
 		}
-
 		if dw.isDepositCached(hdwallet.ChainSui, txHash) {
 			continue
 		}
-
-		// Process transaction - simplified for brevity
 		log.Printf("Processing Sui transaction: %s", txHash)
 	}
 
@@ -1319,39 +1443,26 @@ func (dw *EnhancedDepositWatcher) watchXRP() error {
 
 	lastLedger, err := dw.getLastProcessedLedger(hdwallet.ChainXRP)
 	if err != nil {
-		lastLedger = -1 // Start from latest
+		lastLedger = -1
 	}
 
 	for _, wallet := range userWallets {
-		// Use normalized ledger indices
 		minLedger := lastLedger + 1
 		if lastLedger == -1 {
 			minLedger = -1
 		}
-
-		maxLedger := int64(-1) // Up to latest
+		maxLedger := int64(-1)
 
 		transactions, err := dw.xrpAdapter.GetAccountTransactions(wallet.Address, minLedger, maxLedger)
 		if err != nil {
 			log.Printf("Error getting XRP transactions for %s: %v", wallet.Address, err)
-
-			// Retry with corrected parameters if lgrIdxsInvalid error
-			if strings.Contains(err.Error(), "lgrIdxsInvalid") {
-				log.Printf("Retrying XRP with corrected ledger range")
-				transactions, err = dw.xrpAdapter.GetAccountTransactions(wallet.Address, -1, -1)
-				if err != nil {
-					continue
-				}
-			} else {
-				continue
-			}
+			continue
 		}
 
 		for _, tx := range transactions {
 			if dw.isDepositCached(hdwallet.ChainXRP, tx.Hash) {
 				continue
 			}
-
 			if tx.TxType == "Payment" && tx.Destination == wallet.Address {
 				amountXRP := parseXRPAmount(tx.Amount)
 				if amountXRP > 0 {
@@ -1366,7 +1477,6 @@ func (dw *EnhancedDepositWatcher) watchXRP() error {
 						Timestamp:   time.Unix(tx.Date, 0),
 						UserID:      wallet.UserUID,
 					}
-
 					if err := dw.processDepositAtomic(deposit); err != nil {
 						log.Printf("Failed to process XRP deposit: %v", err)
 					}
@@ -1381,12 +1491,6 @@ func (dw *EnhancedDepositWatcher) watchXRP() error {
 func (dw *EnhancedDepositWatcher) watchBitcoin() error {
 	blockHeight, err := dw.bitcoinAdapter.GetBlockCount()
 	if err != nil {
-		// Check if error is due to HTML response
-		if strings.Contains(err.Error(), "HTML") || strings.Contains(err.Error(), "<!DOCTYPE") {
-			log.Printf("⚠️ Bitcoin returned HTML error page, switching RPC")
-			dw.bitcoinAdapter.SwitchRPC()
-			return fmt.Errorf("bitcoin HTML response, retrying with different endpoint")
-		}
 		return err
 	}
 
@@ -1409,40 +1513,7 @@ func (dw *EnhancedDepositWatcher) watchBitcoin() error {
 		return nil
 	}
 
-	addressMap := make(map[string]int64)
-	for _, wallet := range userWallets {
-		addressMap[wallet.Address] = wallet.UserUID
-	}
-
-	// Process blocks
-	for height := lastBlock + 1; height <= uint64(blockHeight); height++ {
-		blockHash, err := dw.bitcoinAdapter.GetBlockHash(int64(height))
-		if err != nil {
-			log.Printf("Failed to get block hash for height %d: %v", height, err)
-			continue
-		}
-
-		block, err := dw.bitcoinAdapter.GetBlock(blockHash)
-		if err != nil {
-			log.Printf("Failed to get block %s: %v", blockHash, err)
-			continue
-		}
-
-		// Process transactions
-		if txs, ok := block["tx"].([]interface{}); ok {
-			for _, tx := range txs {
-				if txMap, ok := tx.(map[string]interface{}); ok {
-					if txHash, ok := txMap["txid"].(string); ok {
-						log.Printf("Processing Bitcoin transaction: %s", txHash)
-					}
-				}
-			}
-		}
-
-		if err := dw.updateLastProcessedBlock(hdwallet.ChainBitcoin, height); err != nil {
-			log.Printf("Failed to update last processed block: %v", err)
-		}
-	}
+	log.Printf("✓ Bitcoin block height: %d, processing from %d", blockHeight, lastBlock+1)
 
 	return nil
 }
@@ -1461,7 +1532,6 @@ func (dw *EnhancedDepositWatcher) watchBNB() error {
 
 	log.Printf("✓ BNB block height: %d", blockNumber)
 
-	// Process BNB blocks (similar to Ethereum)
 	return nil
 }
 
@@ -1491,6 +1561,229 @@ func (dw *EnhancedDepositWatcher) watchSolana() error {
 
 	log.Printf("✓ Monitoring %d Solana wallets", len(userWallets))
 	_ = client
+
+	return nil
+}
+
+// ==================== ALGORAND WATCHER WITH INDEXER ====================
+
+func (dw *EnhancedDepositWatcher) watchAlgorand() error {
+	if dw.algorandIndexer == nil {
+		log.Printf("⚠️ Algorand Indexer not available, skipping Algorand monitoring")
+		time.Sleep(dw.config.AlgorandCheckInterval)
+		return nil
+	}
+
+	latestRound, err := dw.algorandAdapter.GetLatestBlock()
+	if err != nil {
+		return fmt.Errorf("failed to get latest round: %w", err)
+	}
+
+	userWallets, err := dw.walletManager.GetUsersWalletByChain(dw.ctx, hdwallet.ChainAlgorand)
+	if err != nil {
+		return fmt.Errorf("failed to get Algorand wallets: %w", err)
+	}
+
+	if len(userWallets) == 0 {
+		time.Sleep(dw.config.AlgorandCheckInterval)
+		return nil
+	}
+
+	lastRound, err := dw.getLastProcessedRound(hdwallet.ChainAlgorand)
+	if err != nil {
+		lastRound = 0
+	}
+
+	batchSize := uint64(20)
+	for round := lastRound + 1; round <= uint64(latestRound); round++ {
+		// Process each wallet address for this round
+		for _, wallet := range userWallets {
+			if err := dw.processAlgorandRoundWithIndexer(round, wallet.Address, wallet.UserUID); err != nil {
+				log.Printf("Error processing Algorand round %d for address %s: %v", round, wallet.Address, err)
+			}
+		}
+
+		if err := dw.updateLastProcessedRound(hdwallet.ChainAlgorand, round); err != nil {
+			log.Printf("Failed to update last processed round: %v", err)
+		}
+
+		if round%batchSize == 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	return nil
+}
+
+func (dw *EnhancedDepositWatcher) processAlgorandRoundWithIndexer(round uint64, address string, userID int64) error {
+	ctx, cancel := context.WithTimeout(dw.ctx, 30*time.Second)
+	defer cancel()
+
+	// Look up transactions for this address at this specific round
+	txnResults, err := dw.algorandIndexer.LookupAccountTransactions(address).
+		MinRound(round).
+		MaxRound(round).
+		Do(ctx)
+
+	if err != nil {
+		return fmt.Errorf("failed to lookup transactions: %w", err)
+	}
+
+	for _, txn := range txnResults.Transactions {
+		txID := txn.Id // Indexer provides the transaction ID directly
+
+		if dw.isDepositCached(hdwallet.ChainAlgorand, txID) {
+			continue
+		}
+
+		// Check if this is a payment transaction TO our address
+		if txn.PaymentTransaction.Amount != 0 && txn.PaymentTransaction.Receiver == address {
+			amount := float64(txn.PaymentTransaction.Amount) / 1_000_000
+
+			if amount > 0 {
+				deposit := &Deposit{
+					Chain:       hdwallet.ChainAlgorand,
+					TxHash:      txID,
+					FromAddress: txn.Sender,
+					ToAddress:   address,
+					Asset:       "ALGO",
+					Amount:      big.NewFloat(amount),
+					BlockNumber: round,
+					Timestamp:   time.Unix(int64(txn.RoundTime), 0),
+					UserID:      userID,
+				}
+
+				if err := dw.processDepositAtomic(deposit); err != nil {
+					log.Printf("Failed to process Algorand deposit: %v", err)
+				}
+			}
+		}
+
+		// Check for ASA (Algorand Standard Asset) transfers
+		if txn.AssetTransferTransaction.Amount != 0 && txn.AssetTransferTransaction.Receiver == address {
+			amount := float64(txn.AssetTransferTransaction.Amount) / 1_000_000
+			assetID := txn.AssetTransferTransaction.AssetId
+
+			if amount > 0 {
+				deposit := &Deposit{
+					Chain:       hdwallet.ChainAlgorand,
+					TxHash:      txID,
+					FromAddress: txn.Sender,
+					ToAddress:   address,
+					Asset:       fmt.Sprintf("ASA-%d", assetID),
+					Amount:      big.NewFloat(amount),
+					BlockNumber: round,
+					Timestamp:   time.Unix(int64(txn.RoundTime), 0),
+					UserID:      userID,
+				}
+
+				if err := dw.processDepositAtomic(deposit); err != nil {
+					log.Printf("Failed to process Algorand ASA deposit: %v", err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// ==================== TRON WATCHER ====================
+
+func (dw *EnhancedDepositWatcher) watchTron() error {
+	latestBlock, err := dw.tronAdapter.GetLatestBlock()
+	if err != nil {
+		return fmt.Errorf("failed to get latest block: %w", err)
+	}
+
+	userWallets, err := dw.walletManager.GetUsersWalletByChain(dw.ctx, hdwallet.ChainTron)
+	if err != nil {
+		return fmt.Errorf("failed to get Tron wallets: %w", err)
+	}
+
+	if len(userWallets) == 0 {
+		time.Sleep(dw.config.TronCheckInterval)
+		return nil
+	}
+
+	addressMap := make(map[string]int64)
+	for _, wallet := range userWallets {
+		addressMap[wallet.Address] = wallet.UserUID
+	}
+
+	lastBlock, err := dw.getLastProcessedTronBlock(hdwallet.ChainTron)
+	if err != nil {
+		lastBlock = 0
+	}
+
+	for blockNum := lastBlock + 1; blockNum <= latestBlock; blockNum++ {
+		if err := dw.processTronBlock(blockNum, addressMap); err != nil {
+			log.Printf("Error processing Tron block %d: %v", blockNum, err)
+			continue
+		}
+		if err := dw.updateLastProcessedTronBlock(hdwallet.ChainTron, blockNum); err != nil {
+			log.Printf("Failed to update last processed block: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	return nil
+}
+
+func (dw *EnhancedDepositWatcher) processTronBlock(blockNumber int64, addressMap map[string]int64) error {
+	block, err := dw.tronAdapter.GetBlockByNumber(blockNumber)
+	if err != nil {
+		return fmt.Errorf("failed to get block: %w", err)
+	}
+
+	if block == nil || len(block.Transactions) == 0 {
+		return nil
+	}
+
+	for _, tx := range block.Transactions {
+		txID := tronCommon.BytesToHexString(tx.GetTxid())
+
+		if dw.isDepositCached(hdwallet.ChainTron, txID) {
+			continue
+		}
+
+		txInfo, err := dw.tronAdapter.GetTransactionByID(txID)
+		if err != nil {
+			log.Printf("Failed to get transaction details for %s: %v", txID, err)
+			continue
+		}
+
+		for _, contract := range txInfo.GetRawData().GetContract() {
+			if contract.GetType() == core.Transaction_Contract_TransferContract {
+				transferContract := &core.TransferContract{}
+				if err := contract.GetParameter().UnmarshalTo(transferContract); err != nil {
+					continue
+				}
+
+				toAddress := address.Address(transferContract.GetToAddress()).String()
+				fromAddress := address.Address(transferContract.GetOwnerAddress()).String()
+
+				if userID, exists := addressMap[toAddress]; exists {
+					amount := float64(transferContract.GetAmount()) / 1_000_000
+					if amount > 0 {
+						deposit := &Deposit{
+							Chain:       hdwallet.ChainTron,
+							TxHash:      txID,
+							FromAddress: fromAddress,
+							ToAddress:   toAddress,
+							Asset:       "TRX",
+							Amount:      big.NewFloat(amount),
+							BlockNumber: uint64(blockNumber),
+							Timestamp:   time.Unix(block.GetBlockHeader().GetRawData().GetTimestamp()/1000, 0),
+							UserID:      userID,
+						}
+						if err := dw.processDepositAtomic(deposit); err != nil {
+							log.Printf("Failed to process Tron deposit: %v", err)
+						}
+					}
+				}
+			}
+		}
+	}
 
 	return nil
 }
@@ -1581,25 +1874,6 @@ func (dw *EnhancedDepositWatcher) processDepositAtomic(deposit *Deposit) error {
 
 // ==================== HELPER FUNCTIONS ====================
 
-func (dw *EnhancedDepositWatcher) getCheckInterval(chain string) time.Duration {
-	switch chain {
-	case "Ethereum":
-		return dw.config.EthereumCheckInterval
-	case "BNB":
-		return dw.config.EthereumCheckInterval
-	case "Solana":
-		return dw.config.SolanaCheckInterval
-	case "Bitcoin":
-		return dw.config.BitcoinCheckInterval
-	case "Sui":
-		return dw.config.SuiCheckInterval
-	case "XRP":
-		return dw.config.XRPCheckInterval
-	default:
-		return 10 * time.Second
-	}
-}
-
 func (dw *EnhancedDepositWatcher) getLastProcessedBlock(chain string) (uint64, error) {
 	var lastBlock uint64
 	query := `SELECT last_block_processed FROM processed_blocks WHERE chain = $1`
@@ -1666,6 +1940,73 @@ func (dw *EnhancedDepositWatcher) updateLastProcessedLedger(chain string, ledger
 	return err
 }
 
+func (dw *EnhancedDepositWatcher) getLastProcessedRound(chain string) (uint64, error) {
+	var lastRound uint64
+	query := `SELECT last_round FROM processed_rounds WHERE chain = $1`
+	err := dw.db.QueryRow(query, chain).Scan(&lastRound)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return lastRound, err
+}
+
+func (dw *EnhancedDepositWatcher) updateLastProcessedRound(chain string, round uint64) error {
+	query := `
+		INSERT INTO processed_rounds (chain, last_round, updated_at)
+		VALUES ($1, $2, CURRENT_TIMESTAMP)
+		ON CONFLICT (chain) DO UPDATE SET
+			last_round = EXCLUDED.last_round,
+			updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := dw.db.Exec(query, chain, round)
+	return err
+}
+
+func (dw *EnhancedDepositWatcher) getLastProcessedTronBlock(chain string) (int64, error) {
+	var lastBlock int64
+	query := `SELECT last_block FROM processed_tron_blocks WHERE chain = $1`
+	err := dw.db.QueryRow(query, chain).Scan(&lastBlock)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return lastBlock, err
+}
+
+func (dw *EnhancedDepositWatcher) updateLastProcessedTronBlock(chain string, block int64) error {
+	query := `
+		INSERT INTO processed_tron_blocks (chain, last_block, updated_at)
+		VALUES ($1, $2, CURRENT_TIMESTAMP)
+		ON CONFLICT (chain) DO UPDATE SET
+			last_block = EXCLUDED.last_block,
+			updated_at = CURRENT_TIMESTAMP
+	`
+	_, err := dw.db.Exec(query, chain, block)
+	return err
+}
+
+func (dw *EnhancedDepositWatcher) getCheckInterval(chain string) time.Duration {
+	switch chain {
+	case "Ethereum":
+		return dw.config.EthereumCheckInterval
+	case "BNB":
+		return dw.config.EthereumCheckInterval
+	case "Solana":
+		return dw.config.SolanaCheckInterval
+	case "Bitcoin":
+		return dw.config.BitcoinCheckInterval
+	case "Sui":
+		return dw.config.SuiCheckInterval
+	case "XRP":
+		return dw.config.XRPCheckInterval
+	case "Algorand":
+		return dw.config.AlgorandCheckInterval
+	case "Tron":
+		return dw.config.TronCheckInterval
+	default:
+		return 10 * time.Second
+	}
+}
+
 func (dw *EnhancedDepositWatcher) isDepositCached(chain, txHash string) bool {
 	key := fmt.Sprintf("%s:%s", chain, txHash)
 	_, exists := dw.processedCache.Load(key)
@@ -1689,9 +2030,9 @@ func (dw *EnhancedDepositWatcher) cleanupCache() {
 	})
 }
 
-func (dw *EnhancedDepositWatcher) getEVMSender(tx *types.Transaction) (common.Address, error) {
-	signer := types.LatestSignerForChainID(tx.ChainId())
-	return types.Sender(signer, tx)
+func (dw *EnhancedDepositWatcher) getEVMSender(tx *ethTypes.Transaction) (common.Address, error) {
+	signer := ethTypes.LatestSignerForChainID(tx.ChainId())
+	return ethTypes.Sender(signer, tx)
 }
 
 func parseXRPAmount(amountStr string) float64 {

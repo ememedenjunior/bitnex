@@ -49,6 +49,8 @@ func main() {
 		hdwallet.ChainSolana,
 		hdwallet.ChainSui,
 		hdwallet.ChainXRP,
+		hdwallet.ChainAlgorand,
+		hdwallet.ChainTron,
 	}
 
 	for i, chain := range chains {

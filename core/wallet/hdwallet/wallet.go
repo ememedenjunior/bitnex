@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"crypto/sha512"
 	"cryptohub/pkg/utils"
 	"database/sql"
 	"encoding/hex"
@@ -30,6 +31,8 @@ const (
 	ChainSolana   = "solana"
 	ChainSui      = "sui"
 	ChainXRP      = "xrp"
+	ChainAlgorand = "algorand"
+	ChainTron     = "tron"
 )
 
 // XRP constants
@@ -133,6 +136,12 @@ func (wm *WalletManager) CreateHotWallet(chain string, walletIndex int64) error 
 	case ChainXRP:
 		address, privKeyBytes, err = deriveXRPAddressSLIP10(seed, walletIndex)
 		derivationPath = fmt.Sprintf("m/44'/144'/0'/0/%d", walletIndex)
+	case ChainAlgorand:
+		address, privKeyBytes, err = deriveAlgorandAddressSLIP10(seed, walletIndex)
+		derivationPath = fmt.Sprintf("m/44'/283'/%d'/0'/0", walletIndex)
+	case ChainTron:
+		address, privKeyBytes, err = deriveTronAddressSLIP10(seed, walletIndex)
+		derivationPath = fmt.Sprintf("m/44'/195'/%d'/0/0", walletIndex)
 	default:
 		return fmt.Errorf("unsupported chain: %s", chain)
 	}
@@ -227,6 +236,12 @@ func (wm *WalletManager) CreateUserWallet(ctx context.Context, userUID int64, ch
 	case ChainXRP:
 		address, privKeyBytes, err = deriveXRPAddressSLIP10(seed, derivationIndex)
 		derivationPath = fmt.Sprintf("m/44'/144'/0'/0/%d", derivationIndex)
+	case ChainAlgorand:
+		address, privKeyBytes, err = deriveAlgorandAddressSLIP10(seed, derivationIndex)
+		derivationPath = fmt.Sprintf("m/44'/283'/%d'/0'/0", derivationIndex)
+	case ChainTron:
+		address, privKeyBytes, err = deriveTronAddressSLIP10(seed, derivationIndex)
+		derivationPath = fmt.Sprintf("m/44'/195'/%d'/0/0", derivationIndex)
 	default:
 		return fmt.Errorf("unsupported chain: %s", chain)
 	}
@@ -274,7 +289,7 @@ func (wm *WalletManager) CreateUserWallet(ctx context.Context, userUID int64, ch
 
 // CreateAllUserWallets creates wallets for a user on all supported chains concurrently
 func (wm *WalletManager) CreateAllUserWallets(ctx context.Context, userUID int64) error {
-	chains := []string{ChainEthereum, ChainBNB, ChainBitcoin, ChainSolana, ChainXRP, ChainSui}
+	chains := []string{ChainEthereum, ChainBNB, ChainBitcoin, ChainSolana, ChainXRP, ChainSui, ChainAlgorand, ChainTron}
 
 	type result struct {
 		chain string
@@ -596,4 +611,211 @@ func derivePath(masterKey *bip32.Key, path []uint32) (*bip32.Key, error) {
 		}
 	}
 	return key, nil
+}
+
+// deriveAlgorandAddressSLIP10 - SLIP-0010 compliant derivation for Algorand
+// Algorand uses Ed25519 with path: m/44'/283'/{index}'/0'/0'
+func deriveAlgorandAddressSLIP10(seed []byte, index int64) (string, []byte, error) {
+	// SLIP-0010 path for Algorand: m/44'/283'/{index}'/0'/0'
+	path := fmt.Sprintf("m/44'/283'/%d'/0'/0", index)
+
+	// Create derivation seed from master seed and path
+	derivationSeed := make([]byte, len(seed))
+	copy(derivationSeed, seed)
+
+	pathBytes := []byte(path)
+	combined := append(derivationSeed, pathBytes...)
+
+	// Generate deterministic seed for key generation
+	hash := sha256.Sum256(combined)
+	privateKey := ed25519.NewKeyFromSeed(hash[:32])
+	publicKey := privateKey.Public().(ed25519.PublicKey)
+
+	// Generate Algorand address from public key
+	algoAddress := encodeAlgorandAddress(publicKey)
+
+	// Algorand expects 32-byte private key seed
+	privateKeySeed := privateKey.Seed()
+
+	return algoAddress, privateKeySeed, nil
+}
+
+// encodeAlgorandAddress encodes a public key to Algorand address format
+// Algorand addresses are base32 encoded with a 4-byte checksum
+func encodeAlgorandAddress(publicKey []byte) string {
+	// Algorand uses a specific checksum calculation
+	// Address = base32(publicKey + checksum)
+
+	// Calculate checksum (SHA512_256 of public key)
+	checksum := sha512_256(publicKey)
+
+	// Take first 4 bytes of checksum
+	checksumBytes := checksum[:4]
+
+	// Combine public key and checksum
+	addressBytes := make([]byte, 0, len(publicKey)+4)
+	addressBytes = append(addressBytes, publicKey...)
+	addressBytes = append(addressBytes, checksumBytes...)
+
+	// Encode to base32 (Algorand uses a specific base32 encoding without padding)
+	return base32EncodeAlgorand(addressBytes)
+}
+
+// sha512_256 implements SHA512/256 hash function
+func sha512_256(data []byte) []byte {
+	// This is SHA512 truncated to 256 bits
+	hash := sha512.Sum512(data)
+	return hash[:32]
+}
+
+// base32EncodeAlgorand encodes data to base32 without padding (Algorand format)
+func base32EncodeAlgorand(data []byte) string {
+	const base32Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+
+	if len(data) == 0 {
+		return ""
+	}
+
+	result := make([]byte, 0, len(data)*8/5+8)
+
+	// Process 5 bytes at a time
+	for i := 0; i < len(data); i += 5 {
+		// Get up to 5 bytes
+		chunk := data[i:]
+		if len(chunk) > 5 {
+			chunk = chunk[:5]
+		}
+
+		// Convert to uint64
+		var buffer uint64
+		for j, b := range chunk {
+			buffer |= uint64(b) << uint(8*(4-j))
+		}
+
+		// Extract base32 characters
+		bits := len(chunk) * 8
+		for j := 0; j < bits; j += 5 {
+			if j+5 <= bits {
+				index := (buffer >> uint(40-5-j)) & 31
+				result = append(result, base32Alphabet[index])
+			}
+		}
+	}
+
+	return string(result)
+}
+
+// deriveTronAddressSLIP10 - SLIP-0010 compliant derivation for Tron
+// Tron uses secp256k1 (same as Bitcoin/Ethereum) with path: m/44'/195'/{index}'/0/0
+func deriveTronAddressSLIP10(seed []byte, index int64) (string, []byte, error) {
+	// Create master key from seed
+	masterKey, err := bip32.NewMasterKey(seed)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create master key: %w", err)
+	}
+
+	// Derive path: m/44'/195'/{index}'/0/0
+	key, err := derivePath(masterKey, []uint32{
+		bip32.FirstHardenedChild + 44,
+		bip32.FirstHardenedChild + 195,
+		bip32.FirstHardenedChild + uint32(index),
+		0,
+		0,
+	})
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to derive Tron path: %w", err)
+	}
+
+	// Validate key length
+	if len(key.Key) != 32 {
+		return "", nil, fmt.Errorf("invalid private key length: expected 32, got %d", len(key.Key))
+	}
+
+	// Generate secp256k1 private key
+	privKey, _ := btcec.PrivKeyFromBytes(key.Key)
+
+	// Get uncompressed public key (without prefix)
+	pubKey := privKey.PubKey().SerializeUncompressed()
+
+	// Remove the 0x04 prefix byte
+	pubKeyWithoutPrefix := pubKey[1:]
+
+	// Hash with Keccak256 (Ethereum-style)
+	hash := crypto.Keccak256(pubKeyWithoutPrefix)
+
+	// Take last 20 bytes for the address
+	addressBytes := hash[len(hash)-20:]
+
+	// Add Tron prefix (0x41)
+	tronAddressBytes := append([]byte{0x41}, addressBytes...)
+
+	// Base58Check encode
+	tronAddress := base58CheckEncode(tronAddressBytes)
+
+	return tronAddress, key.Key, nil
+}
+
+// base58CheckEncode encodes data with Base58Check (for Tron addresses)
+func base58CheckEncode(data []byte) string {
+	// Calculate checksum (double SHA256)
+	firstHash := sha256.Sum256(data)
+	secondHash := sha256.Sum256(firstHash[:])
+	checksum := secondHash[:4]
+
+	// Append checksum
+	dataWithChecksum := append(data, checksum...)
+
+	// Base58 encode
+	return base58Encode(dataWithChecksum)
+}
+
+// base58Encode encodes data to Base58 (for Tron addresses)
+func base58Encode(data []byte) string {
+	// Base58 alphabet (Bitcoin style)
+	const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+	if len(data) == 0 {
+		return ""
+	}
+
+	// Count leading zeros
+	zeros := 0
+	for zeros < len(data) && data[zeros] == 0 {
+		zeros++
+	}
+
+	// Convert to base58
+	result := make([]byte, 0, len(data)*2)
+
+	// Process each byte
+	for _, b := range data {
+		carry := uint32(b)
+		for i := 0; i < len(result); i++ {
+			carry += uint32(result[i]) << 8
+			result[i] = byte(carry % 58)
+			carry /= 58
+		}
+		for carry > 0 {
+			result = append(result, byte(carry%58))
+			carry /= 58
+		}
+	}
+
+	// Reverse the result
+	for i, j := 0, len(result)-1; i < j; i, j = i+1, j-1 {
+		result[i], result[j] = result[j], result[i]
+	}
+
+	// Add leading zeros back as '1's in base58
+	encoded := make([]byte, 0, zeros+len(result))
+	for i := 0; i < zeros; i++ {
+		encoded = append(encoded, base58Alphabet[0])
+	}
+
+	// Convert to alphabet characters
+	for _, b := range result {
+		encoded = append(encoded, base58Alphabet[b])
+	}
+
+	return string(encoded)
 }
